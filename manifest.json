@@ -1,0 +1,7 @@
+{
+  "addons": [{
+    "id": "www",
+    "type": "library",
+    "description": "A simple library that provides a web client to fetch, and submit data via HTTP requests."
+  }]
+}
