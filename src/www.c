@@ -26,6 +26,10 @@
   #include <mbedtls/debug.h>
 #endif
 
+#ifndef WWW_VERSION
+  #define WWW_VERSION "unknown"
+#endif
+
 #ifdef WWW_STANDALONE
   #include <lua.h>
   #include <lauxlib.h>
@@ -45,6 +49,7 @@
 #define MAX_RESPONSE_CHUNK 4096
 #define YIELD_TIMEOUT 0.01
 #define MAX_TIMEOUT 5
+#define DEFAULT_REDIRECT_FOLLOWS 10
 
 typedef struct {
   #if _WIN32
@@ -183,31 +188,12 @@ typedef struct request_t {
   struct request_t* next;
 } request_t;
 
-/*
-Takes in a table that describes your request:
-{
-  url = string
-  body = string | function(body_length) | nil
-  method = string
-  headers = string[string]
-  version = "1.1",
-  progress = function(chunk) | nil,
-  callback = function(response, chunk) | nil
-}
-Will act as a blocking request in cases of the main thread, and will yield in case of a coroutine. Will return a table that
-contains the following:
-{
-  headers = table
-  body = string
-},
-
-unless `response` is non-nil, in which case, body will be nil, and the response function will handle everything.
-
-*/
 
 static thread_t* www_thread;
 static mutex_t* www_mutex;
 static request_t* request_queue;
+static char default_user_agent_string[] = "lite-xl-www/" WWW_VERSION;
+
 
 static int min(int a, int b) { return a < b ? a : b; }
 static int lua_objlen(lua_State* L, int idx) {
@@ -215,6 +201,23 @@ static int lua_objlen(lua_State* L, int idx) {
   int n = lua_tointeger(L, -1);
   lua_pop(L, 1);
   return n;
+}
+static int strnicmp(const char* a, const char* b, int n) {
+  for (int i = 0; i < n; ++i) {
+    int difference = b[i] - a[i];
+    if (!difference) {
+      if (!a[i])
+        break;
+    } else
+      return difference > 0 ? 1 : -1;
+  }
+  return 0;
+}
+static int stricmp(const char* a, const char* b) {
+  int lena = strlen(a);
+  int lenb = strlen(b);
+  int cmp = strnicmp(a, b, min(lena, lenb));
+  return cmp == 0 && lena != lenb ? (lena < lenb ? -1 : 1) : cmp;
 }
 
 static request_t* request_enqueue(const char* hostname, unsigned short port, const char* header, int header_length, int is_ssl, int is_get, int verbose) {
@@ -409,9 +412,9 @@ static int www_requestk(lua_State* L, int status, lua_KContext ctx) {
     lock_mutex(www_mutex);
     request_complete(request);
     unlock_mutex(www_mutex);
+    lua_getfield(L, request_response_table_index, "response");
     if (ctx)
       luaL_unref(L, LUA_REGISTRYINDEX, (int)ctx);
-    lua_getfield(L, request_response_table_index, "response");
     return 1;
   } else if (request->state == REQUEST_STATE_ERROR) {
     lua_pop(L, 1);
@@ -442,7 +445,7 @@ static int f_www_request(lua_State* L) {
 
   char* delim;
 
-  if (!(delim = strpbrk(url, ":")) || (delim - url) >= 5)
+  if (!(delim = strpbrk(url, ":")) || (delim - url) > 5)
     goto url_error;
   strncpy(protocol, url, (delim - url));
   if (strncmp(&delim[1], "//", 2) != 0)
@@ -479,17 +482,28 @@ static int f_www_request(lua_State* L) {
   int is_get = strcmp(method, "GET") == 0;
 
   int header_offset = snprintf(header, sizeof(header), "%s %s %s\r\n", method, path, version);
+  int has_host_header = 0;
+  int has_user_agent_header = 0;
   lua_getfield(L, 1, "headers");
   if (!lua_isnil(L, -1)) {
     lua_pushnil(L);
     while (lua_next(L, -2)) {
-      if (header_offset < sizeof(header))
-        header_offset += snprintf(&header[header_offset], sizeof(header) - header_offset, "%s: %s\r\n", luaL_checkstring(L, -2), lua_tostring(L, -1));
+      if (header_offset < sizeof(header)) {
+        const char* header_name = luaL_checkstring(L, -2);
+        if (stricmp(header_name, "user-agent") == 0)
+          has_user_agent_header = 1;
+        if (stricmp(header_name, "host") == 0)
+          has_host_header = 1;
+        header_offset += snprintf(&header[header_offset], sizeof(header) - header_offset, "%s: %s\r\n", header_name, lua_tostring(L, -1));
+      }
       lua_pop(L, 1);
     }
   }
   lua_pop(L, 1);
-  header_offset += snprintf(&header[header_offset], sizeof(header) - header_offset, "Host: %s\r\n", hostname);
+  if (!has_host_header)
+    header_offset += snprintf(&header[header_offset], sizeof(header) - header_offset, "Host: %s\r\n", hostname);
+  if (!has_user_agent_header)
+    header_offset += snprintf(&header[header_offset], sizeof(header) - header_offset, "User-Agent: %s\r\n", default_user_agent_string);
   header[header_offset++] = '\r';
   header[header_offset++] = '\n';
   header[header_offset++] = 0;
@@ -787,12 +801,95 @@ static int f_www_gc(lua_State* L) {
   lua_call(L, 1, 0);
 }
 
+// merges the first table into the second on the stack.
+static void www_merge_tables(lua_State* L) {
+  lua_pushnil(L);
+  while (lua_next(L, -3)) {
+    lua_pushvalue(L, -2);
+    lua_pushvalue(L, -2);
+    lua_rawset(L, -5);
+    lua_pop(L, 2);
+  }
+}
+
+static int www_method(const char* method, int has_body, lua_State* L) {
+  luaL_checktype(L, 1, LUA_TTABLE);
+  luaL_checktype(L, 2, LUA_TSTRING);
+  if (lua_gettop(L) == (has_body ? 3 : 2))
+    lua_newtable(L);
+  if (has_body) {
+    luaL_checktype(L, 3, LUA_TSTRING);
+    luaL_checktype(L, 4, LUA_TTABLE);
+  } else
+    luaL_checktype(L, 3, LUA_TTABLE);
+  lua_getfield(L, 1, "options");
+  lua_newtable(L);
+  www_merge_tables(L);
+  www_merge_tables(L);
+  int request_parameters_index = lua_gettop(L);
+  lua_pushliteral(L, "url");
+  lua_pushvalue(L, 1);
+  lua_rawset(L, request_parameters_index);
+  lua_pushliteral(L, "method");
+  lua_pushstring(L, method);
+  lua_rawset(L, request_parameters_index);
+  if (has_body) {
+    lua_pushliteral(L, "body");
+    lua_pushvalue(L, 2);
+    lua_rawset(L, request_parameters_index);
+  }
+  lua_pushcfunction(L, f_www_request);
+  lua_pushvalue(L, request_parameters_index);
+  lua_call(L, 1, 1);
+
+  // Check for redirects.
+  lua_getfield(L, -1, "redirects");
+  int redirects = lua_isnil(L, -1) ? DEFAULT_REDIRECT_FOLLOWS : lua_tointeger(L, -1);
+  lua_pop(L, 1);
+  while (redirects > 0) {
+    lua_getfield(L, -1, "code");
+    int code = lua_tointeger(L, -1);
+    lua_pop(L, 1);
+    if (code >= 300 && code < 300) {
+      lua_getfield(L, 1, "redirected");
+      int redirected_count = lua_isnil(L, -1) ? lua_tointeger(L, -1) : 0;
+      lua_pop(L, 1);
+      if (redirected_count > redirects)
+        return luaL_error(L, "redirected %d, which is over the redirect threshold of %d", redirected_count, redirects);
+      lua_getfield(L, -1, "headers");
+      lua_getfield(L, -1, "location");
+      if (lua_isnil(L, -1))
+        return luaL_error(L, "tried to redirect %d times, but server responded with 300, and no location header.", redirected_count);
+      lua_setfield(L, request_parameters_index, "url");
+      lua_pop(L, 2);
+      lua_pushcfunction(L, f_www_request);
+      lua_pushvalue(L, request_parameters_index);
+      lua_call(L, 1, 1);
+    } else
+      break;
+  }
+  lua_pop(L, 1);
+  // End redirect code.
+  lua_getfield(L, -1, "body");
+  lua_pushvalue(L, -2);
+  return 2;
+}
+
+static int f_www_get(lua_State* L)   { return www_method("GET", 0, L); }
+static int f_www_post(lua_State* L)   { return www_method("POST", 1, L); }
+static int f_www_put(lua_State* L)    { return www_method("PUT", 1, L); }
+static int f_www_delete(lua_State* L) { return www_method("DELETE", 1, L); }
 
 static luaL_Reg www_api[] = {
-  { "request",  f_www_request },
-  // { "get",      f_www_get     },
-  { "ssl",      f_www_ssl     },
-  { "__gc",     f_www_gc },
+  // Core functions, `request` is the primary function, and is stateless (minus the ssl config), and makes raw requests.
+  { "__gc",     f_www_gc      },
+  { "request",  f_www_request },    // { headers = table, body = string } = www.request({ url = string, body = string|function(), method = string|"GET", headers = table|{}, callback = nil|function(response, chunk), progress = function()|nil  })
+  { "ssl",      f_www_ssl     },    // www.ssl(type, path|nil)
+  // Utility functions; to set default options, set www.options, default set to { redirects = 10 }.
+  { "get",      f_www_get     },    // body, response = www:get(url, options|nil)
+  { "post",     f_www_post    },    // body, response = www:post(url, body, options|nil)
+  { "put",      f_www_put     },    // body, response = www:put(url, body, options|nil)
+  { "delete",   f_www_delete  },    // body, response = www:delete(url, body, options|nil)
   { NULL, NULL }
 };
 
@@ -814,6 +911,8 @@ int luaopen_www(lua_State* L) {
   lua_concat(L, 2);
   lua_call(L, 2, 0);
   luaL_newlib(L, www_api);
+  lua_newtable(L);
+  lua_setfield(L, -2, "options");
   lua_pushvalue(L, -1);
   lua_setmetatable(L, -2);
   www_mutex = new_mutex();
