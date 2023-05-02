@@ -1,3 +1,6 @@
-[submodule "lib/mbedtls"]
-	path = lib/mbedtls
-	url = https://github.com/Mbed-TLS/mbedtls.git
+[submodule "lib/zlib"]
+	path = lib/zlib
+	url = https://github.com/madler/zlib.git
+[submodule "lib/lite-xl"]
+	path = lib/lite-xl
+	url = https://github.com/lite-xl/lite-xl.git
