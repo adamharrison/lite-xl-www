@@ -241,12 +241,11 @@ static request_t* request_enqueue(const char* hostname, unsigned short port, con
     mbedtls_ssl_init(&request->ssl_context);
     mbedtls_net_init(&request->net_context);
   }
-  if (!request_queue) {
-    www_thread = create_thread(www_request_thread_callback, NULL);
-  } else {
+  if (request_queue) {
     request_queue->prev = request;
     request->next = request_queue;
-  }
+  } else
+    www_thread = create_thread(www_request_thread_callback, NULL);
   request_queue = request;
   unlock_mutex(www_mutex);
   return request;
@@ -254,6 +253,7 @@ static request_t* request_enqueue(const char* hostname, unsigned short port, con
 
 
 static void request_complete(request_t* request) {
+  lock_mutex(www_mutex);
   if (request->prev)
     request->prev->next = request->next;
   else
@@ -267,6 +267,15 @@ static void request_complete(request_t* request) {
   if (request->socket != -1)
     close(request->socket);
   free(request);
+  if (!request_queue) {
+    if (www_thread) {
+      unlock_mutex(www_mutex);
+      join_thread(www_thread);
+      lock_mutex(www_mutex);
+    }
+    www_thread = NULL;
+  }
+  unlock_mutex(www_mutex);
 }
 
 static int www_requestk(lua_State* L, int status, lua_KContext ctx) {
@@ -418,9 +427,7 @@ static int www_requestk(lua_State* L, int status, lua_KContext ctx) {
       sleep_in_miliseconds(1);
   } while (!ctx && request->state != REQUEST_STATE_RECV_COMPLETE && request->state != REQUEST_STATE_ERROR);
   if (request->state == REQUEST_STATE_RECV_COMPLETE) {
-    lock_mutex(www_mutex);
     request_complete(request);
-    unlock_mutex(www_mutex);
     lua_getfield(L, request_response_table_index, "response");
     if (ctx)
       luaL_unref(L, LUA_REGISTRYINDEX, (int)ctx);
@@ -428,9 +435,7 @@ static int www_requestk(lua_State* L, int status, lua_KContext ctx) {
   } else if (request->state == REQUEST_STATE_ERROR) {
     lua_pop(L, 1);
     lua_pushfstring(L, "error in request: %s", request->chunk);
-    lock_mutex(www_mutex);
     request_complete(request);
-    unlock_mutex(www_mutex);
     return lua_error(L);
   } else {
     lua_pushnumber(L, YIELD_TIMEOUT);
@@ -451,8 +456,10 @@ static int split_protocol_hostname_path(const char* url, char* protocol, char* h
   if ((hostname_delim = strpbrk(delim, "/"))) {
     strncpy(hostname, delim, min(MAX_HOSTNAME_SIZE, hostname_delim - delim));
     strncpy(path, hostname_delim, MAX_PATH_SIZE);
-  } else
+  } else {
     strncpy(hostname, delim, MAX_HOSTNAME_SIZE);
+    strncpy(path, "/", MAX_PATH_SIZE);
+  }
   return 0;
 }
 
@@ -707,7 +714,6 @@ static void* www_request_thread_callback(void* data) {
     lock_mutex(www_mutex);
     int should_exit = request_queue == NULL;
     if (should_exit) {
-      www_thread = NULL;
       unlock_mutex(www_mutex);
       break;
     }
@@ -831,17 +837,8 @@ static int f_www_ssl(lua_State* L) {
 
 
 static int f_www_gc(lua_State* L) {
-  lock_mutex(www_mutex);
-  request_t* request = request_queue;
-  while (request) {
-    request_t* next = request->next;
-    request_complete(request);
-    request = next;
-  }
-  request_queue = NULL;
-  unlock_mutex(www_mutex);
-  if (www_thread)
-    join_thread(www_thread);
+  while (request_queue)
+    request_complete(request_queue);
   free_mutex(www_mutex);
   lua_pushcfunction(L, f_www_ssl);
   lua_pushliteral(L, "none");
@@ -858,6 +855,7 @@ static void www_merge_tables(lua_State* L) {
     lua_pop(L, 1);
   }
 }
+
 
 static int f_www_agent_request(lua_State* L) {
   luaL_checktype(L, 1, LUA_TTABLE);
@@ -911,8 +909,8 @@ static int f_www_agent_request(lua_State* L) {
 
       const char* redirect_url = lua_tostring(L, -1);
       if (redirect_url[0] == '/') {
-        char protocol[MAX_PROTOCOL_SIZE] = {0};
         char hostname[MAX_HOSTNAME_SIZE] = {0};
+        char protocol[MAX_PROTOCOL_SIZE] = {0};
         char path[MAX_PATH_SIZE] = "/";
         if (split_protocol_hostname_path(url, protocol, hostname, path))
           return luaL_error(L, "can't parse redirect url: %s", redirect_url);
@@ -998,8 +996,6 @@ static int f_www_new(lua_State* L) {
     lua_newtable(L);
   }
   lua_setfield(L, -2, "options");
-  /*lua_newtable(L);
-  lua_setfield(L, -1, "cookies");*/
   return 1;
 }
 
