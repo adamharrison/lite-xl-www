@@ -339,9 +339,9 @@ static int www_requestk(lua_State* L, int status, lua_KContext ctx) {
           }
           lua_setfield(L, -2, "headers");
           size_t header_length = request->chunk_length - (header_start - request->chunk);
-          memmove(request->chunk, header_start, header_length);
+          memmove(request->chunk, header_start, request->chunk_length - header_length);
           request->chunk_length -= header_length;
-          request->body_transmitted = request->chunk_length;
+          request->body_transmitted = request->chunk_length - header_length;
           request->state = REQUEST_STATE_RECV_BODY;
           lua_pop(L, 1);
         // deliberate fallthrough.
@@ -369,7 +369,8 @@ static int www_requestk(lua_State* L, int status, lua_KContext ctx) {
                 lua_setfield(L, -3, "body");
               }
               lua_pushlstring(L, request->chunk, request->chunk_length);
-              lua_rawseti(L, -2, lua_objlen(L, -2) + 1);
+              int n = lua_objlen(L, -2) + 1;
+              lua_rawseti(L, -2, n);
               request->chunk_length = 0;
               lua_pop(L, 2);
             }
@@ -377,19 +378,17 @@ static int www_requestk(lua_State* L, int status, lua_KContext ctx) {
           if (request->body_transmitted >= request->body_length) {
             lua_getfield(L, request_response_table_index, "response");
             lua_getfield(L, -1, "body");
+            int body_table_index = lua_gettop(L);
             if (lua_type(L, -1) == LUA_TTABLE) {
               int n = lua_objlen(L, -1);
               luaL_Buffer b;
               luaL_buffinit(L, &b);
               for (int i = 1; i <= n; ++i) {
-                lua_rawgeti(L, -1, i);
-                size_t len;
-                const char* chunk = lua_tolstring(L, -1, &len);
-                luaL_addlstring(&b, chunk, len);
-                lua_pop(L, 1);
+                lua_rawgeti(L, body_table_index, i);
+                luaL_addvalue(&b);
               }
               luaL_pushresult(&b);
-              lua_setfield(L, -3, "body");
+              lua_setfield(L, body_table_index - 1, "body");
             }
             lua_pop(L, 2);
             request->state = REQUEST_STATE_RECV_COMPLETE;
@@ -430,6 +429,23 @@ static int www_requestk(lua_State* L, int status, lua_KContext ctx) {
   return 0;
 }
 
+static int split_protocol_hostname_path(const char* url, char* protocol, char* hostname, char* path) {
+  char* delim;
+  if (!(delim = strpbrk(url, ":")) || (delim - url) > 5)
+    return -1;
+  strncpy(protocol, url, (delim - url));
+  if (strncmp(&delim[1], "//", 2) != 0)
+    return -1;
+  delim += 3;
+  char* hostname_delim;
+  if ((hostname_delim = strpbrk(delim, "/"))) {
+    strncpy(hostname, delim, min(MAX_HOSTNAME_SIZE, hostname_delim - delim));
+    strncpy(path, hostname_delim, MAX_PATH_SIZE);
+  } else
+    strncpy(hostname, delim, MAX_HOSTNAME_SIZE);
+  return 0;
+}
+
 static int f_www_request(lua_State* L) {
   long response_code;
   char method[MAX_METHOD_SIZE];
@@ -442,25 +458,8 @@ static int f_www_request(lua_State* L) {
 
   lua_getfield(L, 1, "url");
   const char* url = luaL_checkstring(L, -1);
-
-  char* delim;
-
-  if (!(delim = strpbrk(url, ":")) || (delim - url) > 5)
-    goto url_error;
-  strncpy(protocol, url, (delim - url));
-  if (strncmp(&delim[1], "//", 2) != 0)
-    goto url_error;
-  delim += 3;
-  char* hostname_delim;
-  if ((hostname_delim = strpbrk(delim, "/"))) {
-    strncpy(hostname, delim, min(sizeof(hostname), hostname_delim - delim));
-    strncpy(path, hostname_delim, sizeof(path));
-  } else
-    strncpy(hostname, delim, sizeof(hostname));
-
-  url_error:
-  if (!protocol[0] || !hostname[0] || !path[0])
-      return luaL_error(L, "unable to parse URL %s", url);
+  if (split_protocol_hostname_path(url, protocol, hostname, path))
+    return luaL_error(L, "unable to parse URL %s", url);
   if (strcmp(protocol, "http") != 0 && strcmp(protocol, "https") != 0)
     return luaL_error(L, "unrecognized protocol");
 
@@ -814,7 +813,7 @@ static void www_merge_tables(lua_State* L) {
 
 static int www_method(const char* method, int has_body, lua_State* L) {
   luaL_checktype(L, 1, LUA_TTABLE);
-  luaL_checktype(L, 2, LUA_TSTRING);
+  const char* url = luaL_checkstring(L, 2);
   if (lua_gettop(L) == (has_body ? 3 : 2))
     lua_newtable(L);
   if (has_body) {
@@ -828,7 +827,7 @@ static int www_method(const char* method, int has_body, lua_State* L) {
   www_merge_tables(L);
   int request_parameters_index = lua_gettop(L);
   lua_pushliteral(L, "url");
-  lua_pushvalue(L, 1);
+  lua_pushvalue(L, 2);
   lua_rawset(L, request_parameters_index);
   lua_pushliteral(L, "method");
   lua_pushstring(L, method);
@@ -841,16 +840,15 @@ static int www_method(const char* method, int has_body, lua_State* L) {
   lua_pushcfunction(L, f_www_request);
   lua_pushvalue(L, request_parameters_index);
   lua_call(L, 1, 1);
-
   // Check for redirects.
-  lua_getfield(L, -1, "redirects");
+  lua_getfield(L, request_parameters_index, "redirects");
   int redirects = lua_isnil(L, -1) ? DEFAULT_REDIRECT_FOLLOWS : lua_tointeger(L, -1);
   lua_pop(L, 1);
   while (redirects > 0) {
     lua_getfield(L, -1, "code");
     int code = lua_tointeger(L, -1);
     lua_pop(L, 1);
-    if (code >= 300 && code < 300) {
+    if (code >= 300 && code < 400) {
       lua_getfield(L, 1, "redirected");
       int redirected_count = lua_isnil(L, -1) ? lua_tointeger(L, -1) : 0;
       lua_pop(L, 1);
@@ -860,6 +858,17 @@ static int www_method(const char* method, int has_body, lua_State* L) {
       lua_getfield(L, -1, "location");
       if (lua_isnil(L, -1))
         return luaL_error(L, "tried to redirect %d times, but server responded with 300, and no location header.", redirected_count);
+
+      const char* redirect_url = lua_tostring(L, -1);
+      if (redirect_url[0] == '/') {
+        char protocol[MAX_PROTOCOL_SIZE] = {0};
+        char hostname[MAX_HOSTNAME_SIZE] = {0};
+        char path[MAX_PATH_SIZE] = "/";
+        if (split_protocol_hostname_path(url, protocol, hostname, path))
+          return luaL_error(L, "can't parse redirect url: %s", redirect_url);
+        lua_pushfstring(L, "%s://%s%s", protocol, hostname, redirect_url);
+        lua_replace(L, -2);
+      }
       lua_setfield(L, request_parameters_index, "url");
       lua_pop(L, 2);
       lua_pushcfunction(L, f_www_request);
@@ -868,7 +877,6 @@ static int www_method(const char* method, int has_body, lua_State* L) {
     } else
       break;
   }
-  lua_pop(L, 1);
   // End redirect code.
   lua_getfield(L, -1, "body");
   lua_pushvalue(L, -2);
