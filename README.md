@@ -1,4 +1,4 @@
-# lite-xl-wwww
+# lite-xl-www
 
 A simple library that provides a web client to fetch, and submit data via HTTP(S) requests.
 

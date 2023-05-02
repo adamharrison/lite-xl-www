@@ -7,8 +7,13 @@
   #include <netdb.h>
   #include <sys/socket.h>
   #include <arpa/inet.h>
+  #include <unistd.h>
 #endif
+#include <ctype.h>
 #include <time.h>
+#include <string.h>
+#include <math.h>
+#include <sys/stat.h>
 #include <mbedtls/sha256.h>
 #include <mbedtls/x509.h>
 #include <mbedtls/entropy.h>
@@ -54,7 +59,7 @@ typedef struct {
   #if _WIN32
     HANDLE mutex;
   #else
-    pthread_mutex_t* mutex;
+    pthread_mutex_t mutex;
   #endif
 } mutex_t;
 
@@ -81,7 +86,7 @@ static mutex_t* free_mutex(mutex_t* mutex) {
   #if _WIN32
     CloseHandle(mutex->mutex);
   #else
-    pthread_mutex_destroy(mutex->mutex);
+    pthread_mutex_destroy(&mutex->mutex);
   #endif
   free(mutex);
 }
@@ -90,7 +95,7 @@ static int lock_mutex(mutex_t* mutex) {
   #if _WIN32
     WaitForSingleObject(mutex->mutex, INFINITE);
   #else
-    pthread_mutex_lock(mutex->mutex);
+    pthread_mutex_lock(&mutex->mutex);
   #endif
 }
 
@@ -98,7 +103,7 @@ static int unlock_mutex(mutex_t* mutex) {
   #if _WIN32
     ReleaseMutex(mutex->mutex)
   #else
-    pthread_mutex_unlock(mutex->mutex);
+    pthread_mutex_unlock(&mutex->mutex);
   #endif
 }
 
@@ -114,7 +119,7 @@ static int is_main_thread(lua_State* L) {
   return is_main;
 }
 
-static int www_request_thread_callback(void* data);
+static void* www_request_thread_callback(void* data);
 
 #if _WIN32
 static DWORD windows_thread_callback(void* data) {
@@ -141,7 +146,7 @@ static void* join_thread(thread_t* thread) {
   #if _WIN32
     WaitForSingleObject(thread->thread, INFINITE);
   #else
-    pthread_join(thread, &retval);
+    pthread_join(thread->thread, &retval);
   #endif
   free(thread);
   return retval;
@@ -162,7 +167,7 @@ typedef struct request_t {
   int socket;
   char hostname[MAX_HOSTNAME_SIZE];
   char chunk[MAX_REQUEST_HEADER_SIZE];
-  int chunk_length;
+  size_t chunk_length;
   int is_get;
   int is_ssl;
   int body_length;
@@ -201,6 +206,14 @@ unless `response` is non-nil, in which case, body will be nil, and the response 
 static thread_t* www_thread;
 static mutex_t* www_mutex;
 static request_t* request_queue;
+
+static int min(int a, int b) { return a < b ? a : b; }
+static int lua_objlen(lua_State* L, int idx) {
+  lua_len(L, idx);
+  int n = lua_tointeger(L, -1);
+  lua_pop(L, 1);
+  return n;
+}
 
 static request_t* request_enqueue(const char* hostname, unsigned short port, const char* header, int header_length, int is_ssl) {
   lock_mutex(www_mutex);
@@ -268,11 +281,11 @@ static int www_requestk(lua_State* L, int status, lua_KContext ctx) {
               size_t len;
               const char* buffer = lua_tolstring(L, -1, &len);
               request->body_length = len;
-              memcpy(&request->chunk[request->chunk_length], buffer[request->body_transmitted], min(sizeof(request->chunk) - request->chunk_length, len - request->body_transmitted));
+              memcpy(&request->chunk[request->chunk_length], &buffer[request->body_transmitted], min(sizeof(request->chunk) - request->chunk_length, len - request->body_transmitted));
             break;
             case LUA_TFUNCTION:
             default: {
-              lua_pushfstring("error transmitting body: %s", request->chunk); has_error = 1;
+              lua_pushfstring(L, "error transmitting body: %s", request->chunk); has_error = 1;
               goto error;
             }
           }
@@ -281,7 +294,7 @@ static int www_requestk(lua_State* L, int status, lua_KContext ctx) {
           int code;
           char status_line[128];
           if (sscanf(request->chunk, "HTTP/1.1 %d %128s\r\n", &code, status_line) < 2) {
-            lua_pushfstring("error processing headers: %s", request->chunk); has_error = 1;
+            lua_pushfstring(L, "error processing headers: %s", request->chunk); has_error = 1;
             goto error;
           }
           lua_getfield(L, request_response_table_index, "response");
@@ -297,10 +310,10 @@ static int www_requestk(lua_State* L, int status, lua_KContext ctx) {
               if (header_start[0] == '\r' && header_start[1] == '\n')
                 break;
             }
-            const char* value_offset = strstr(header_start, ":");
-            const char* header_end = strstr(header_start, "\r\n");
+            char* value_offset = strstr(header_start, ":");
+            char* header_end = strstr(header_start, "\r\n");
             if (value_offset > header_end) {
-              lua_pushfstring("error processing headers: %s", request->chunk); has_error = 1;
+              lua_pushfstring(L, "error processing headers: %s", request->chunk); has_error = 1;
               goto error;
             }
             int header_name_length = value_offset - header_start;
@@ -385,13 +398,13 @@ static int www_requestk(lua_State* L, int status, lua_KContext ctx) {
     request_complete(request);
     return lua_error(L);
   } else {
-    lua_pusnumber(L, YIELD_TIMEOUT);
+    lua_pushnumber(L, YIELD_TIMEOUT);
     lua_yieldk(L, 1, ctx, www_requestk);
   }
   return 0;
 }
 
-static int www_request(lua_State* L) {
+static int f_www_request(lua_State* L) {
   long response_code;
   char method[MAX_METHOD_SIZE];
   char protocol[MAX_PROTOCOL_SIZE];
@@ -420,7 +433,7 @@ static int www_request(lua_State* L) {
   lua_pop(L, 1);
 
   int header_offset = snprintf(header, sizeof(header), "%s %s %s\r\n", method, path, version);
-  lua_getfield(L, "headers", 1);
+  lua_getfield(L, 1, "headers");
   lua_pushnil(L);
   while (lua_next(L, -2)) {
     if (header_offset < sizeof(header))
@@ -468,7 +481,7 @@ static int request_socket_write(request_t* request, const char* buf, int len) {
   return request->is_ssl ? mbedtls_ssl_write(&request->ssl_context, buf, len) : write(request->socket, buf, len);
 }
 
-static int request_socket_read(request_t* request, const char* buf, int len) {
+static int request_socket_read(request_t* request, char* buf, int len) {
   return request->is_ssl ? mbedtls_ssl_read(&request->ssl_context, buf, len) : read(request->socket, buf, len);
 }
 
@@ -480,14 +493,14 @@ static int check_request(request_t* request) {
       if (request->is_ssl) {
         int status;
         char port[10];
-        snprintf(port, request->port, sizeof(port));
+        snprintf(port, sizeof(char), "%d", request->port);
         // https://gist.github.com/Barakat/675c041fd94435b270a25b5881987a30
         if ((status = mbedtls_ssl_setup(&request->ssl_context, &ssl_config)) != 0) {
           mbedtls_snprintf(1, err, sizeof(err), status, "can't set up ssl for %s: %d", request->hostname, status); goto cleanup;
         }
         mbedtls_net_set_nonblock(&request->net_context);
         mbedtls_ssl_set_bio(&request->ssl_context, &request->net_context, mbedtls_net_send, NULL, mbedtls_net_recv_timeout);
-        if ((status = mbedtls_net_connect(&request->net_context, request->hostname, request->port, MBEDTLS_NET_PROTO_TCP)) != 0) {
+        if ((status = mbedtls_net_connect(&request->net_context, request->hostname, port, MBEDTLS_NET_PROTO_TCP)) != 0) {
           mbedtls_snprintf(1, err, sizeof(err), status, "can't connect to hostname %s", request->hostname); goto cleanup;
         } else if ((status = mbedtls_ssl_set_hostname(&request->ssl_context, request->hostname)) != 0) {
           mbedtls_snprintf(1, err, sizeof(err), status, "can't set hostname %s", request->hostname); goto cleanup;
@@ -538,7 +551,7 @@ static int check_request(request_t* request) {
       int bytes_written = request_socket_write(request, request->chunk, request->chunk_length);
       if (bytes_written < 0) {
         request->state = REQUEST_STATE_ERROR;
-        return;
+        return 0;
       }
       if (bytes_written == request->chunk_length) {
         request->chunk_length = 0;
@@ -557,7 +570,7 @@ static int check_request(request_t* request) {
       int bytes_read = request_socket_read(request, &request->chunk[request->chunk_length], sizeof(request->chunk) - request->chunk_length);
       if (bytes_read < 0) {
         request->state = REQUEST_STATE_ERROR;
-        return;
+        return 0;
       }
       if (bytes_read > 0) {
         const char* boundary = strstr(request->chunk, "\r\n\r\n");
@@ -570,7 +583,7 @@ static int check_request(request_t* request) {
         int bytes_read = request_socket_read(request, &request->chunk[request->chunk_length], sizeof(request->chunk) - request->chunk_length);
         if (bytes_read < 0) {
           request->state = REQUEST_STATE_ERROR;
-          return;
+          return 0;
         } else if (bytes_read > 0) {
           request->body_transmitted += bytes_read;
         }
@@ -578,13 +591,15 @@ static int check_request(request_t* request) {
     break;
     case REQUEST_STATE_RECV_PROCESS_HEADERS: break;
   }
+  return -1;
 }
 
-static int www_request_thread_callback(void* data) {
+static void* www_request_thread_callback(void* data) {
   while (1) {
     lock_mutex(www_mutex);
     int should_exit = request_queue != NULL;
     if (should_exit) {
+      www_thread = NULL;
       unlock_mutex(www_mutex);
       break;
     }
@@ -594,10 +609,12 @@ static int www_request_thread_callback(void* data) {
       request = request->next;
     }
   }
+  return NULL;
 }
 
 static int ssl_initialized;
 static int f_www_ssl(lua_State* L) {
+  char err[1024] = {0};
   const char* type = luaL_checkstring(L, 1);
   int status;
   if (ssl_initialized) {
@@ -612,8 +629,10 @@ static int f_www_ssl(lua_State* L) {
   mbedtls_x509_crt_init(&x509_certificate);
   mbedtls_entropy_init(&entropy_context);
   mbedtls_ctr_drbg_init(&drbg_context);
-  if ((status = mbedtls_ctr_drbg_seed(&drbg_context, mbedtls_entropy_func, &entropy_context, NULL, 0)) != 0)
-    return luaL_mbedtls_error(L, status, "failed to setup mbedtls_x509");
+  if ((status = mbedtls_ctr_drbg_seed(&drbg_context, mbedtls_entropy_func, &entropy_context, NULL, 0)) != 0) {
+    mbedtls_snprintf(1, err, sizeof(err), status, "failed to setup mbedtls_x509");
+    return luaL_error(L, "%s", err);
+  }
   mbedtls_ssl_config_init(&ssl_config);
   status = mbedtls_ssl_config_defaults(&ssl_config, MBEDTLS_SSL_IS_CLIENT, MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT);
   mbedtls_ssl_conf_max_version(&ssl_config, MBEDTLS_SSL_MAJOR_VERSION_3, MBEDTLS_SSL_MINOR_VERSION_3);
@@ -622,10 +641,10 @@ static int f_www_ssl(lua_State* L) {
   mbedtls_ssl_conf_rng(&ssl_config, mbedtls_ctr_drbg_random, &drbg_context);
   mbedtls_ssl_conf_read_timeout(&ssl_config, 5000);
   #if defined(MBEDTLS_DEBUG_C)
-  if (print_trace) {
+  /*if (print_trace) {
     mbedtls_debug_set_threshold(5);
     //mbedtls_ssl_conf_dbg(&ssl_config, lpm_tls_debug, NULL);
-  }
+  }*/
   #endif
   ssl_initialized = 1;
   if (strcmp(type, "noverify") == 0) {
@@ -662,18 +681,18 @@ static int f_www_ssl(lua_State* L) {
         CertCloseStore(hSystemStore, 0);
       #else
         const char* paths[] = {
-          "/etc/ssl/certs/ca-certificates.crt",                -- Debian/Ubuntu/Gentoo etc.
-          "/etc/pki/tls/certs/ca-bundle.crt",                  -- Fedora/RHEL 6
-          "/etc/ssl/ca-bundle.pem",                            -- OpenSUSE
-          "/etc/pki/tls/cacert.pem",                           -- OpenELEC
-          "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem", -- CentOS/RHEL 7
-          "/etc/ssl/cert.pem",                                 -- Alpine Linux (and Mac OSX)
-          "/etc/ssl/certs",                                    -- SLES10/SLES11, https://golang.org/issue/12139
-          "/system/etc/security/cacerts",                      -- Android
-          "/usr/local/share/certs",                            -- FreeBSD
-          "/etc/pki/tls/certs",                                -- Fedora/RHEL
-          "/etc/openssl/certs",                                -- NetBSD
-          "/var/ssl/certs",                                    -- AIX
+          "/etc/ssl/certs/ca-certificates.crt",                // Debian/Ubuntu/Gentoo etc.
+          "/etc/pki/tls/certs/ca-bundle.crt",                  // Fedora/RHEL 6
+          "/etc/ssl/ca-bundle.pem",                            // OpenSUSE
+          "/etc/pki/tls/cacert.pem",                           // OpenELEC
+          "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem", // CentOS/RHEL 7
+          "/etc/ssl/cert.pem",                                 // Alpine Linux (and Mac OSX)
+          "/etc/ssl/certs",                                    // SLES10/SLES11, https://golang.org/issue/12139
+          "/system/etc/security/cacerts",                      // Android
+          "/usr/local/share/certs",                            // FreeBSD
+          "/etc/pki/tls/certs",                                // Fedora/RHEL
+          "/etc/openssl/certs",                                // NetBSD
+          "/var/ssl/certs",                                    // AIX
           NULL
         };
         for (int i = 0; paths[i]; ++i) {
@@ -685,21 +704,14 @@ static int f_www_ssl(lua_State* L) {
         }
       #endif
     }
-    if ((status = mbedtls_x509_crt_parse_file(&x509_certificate, path)) != 0)
-      return luaL_mbedtls_error(L, status, "mbedtls_x509_crt_parse_file failed to parse CA certificate %s", path);
+    if ((status = mbedtls_x509_crt_parse_file(&x509_certificate, path)) != 0) {
+      mbedtls_snprintf(1, err, sizeof(err), status, "mbedtls_x509_crt_parse_file failed to parse CA certificate %s", path);
+      return luaL_error(L, "%s", err);
+    }
     mbedtls_ssl_conf_ca_chain(&ssl_config, &x509_certificate, NULL);
   }
   return 0;
 }
-
-static luaL_Reg www_api[] = {
-  { "request",  f_www_request },
-  { "get",      f_www_get     },
-  { "ssl",      f_www_ssl     },
-  { "__gc",     f_www_release },
-  { NULL, NULL }
-};
-
 
 
 static int f_www_release(lua_State* L) {
@@ -712,12 +724,22 @@ static int f_www_release(lua_State* L) {
   }
   request_queue = NULL;
   unlock_mutex(www_mutex);
-  join_thread(www_thread);
+  if (www_thread)
+    join_thread(www_thread);
   free_mutex(www_mutex);
   lua_pushcfunction(L, f_www_ssl);
   lua_pushliteral(L, "none");
   lua_call(L, 1, 0);
 }
+
+
+static luaL_Reg www_api[] = {
+  { "request",  f_www_request },
+  // { "get",      f_www_get     },
+  { "ssl",      f_www_ssl     },
+  { "__gc",     f_www_release },
+  { NULL, NULL }
+};
 
 
 #ifndef WWW_STANDALONE
@@ -740,7 +762,6 @@ int luaopen_www(lua_State* L) {
   lua_pushvalue(L, -1);
   lua_setmetatable(L, -2);
   www_mutex = new_mutex();
-  www_thread = create_thread(www_request_thread_callback, NULL);
   return 1;
 }
 
