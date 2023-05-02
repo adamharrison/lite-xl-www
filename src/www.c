@@ -330,7 +330,7 @@ static int www_requestk(lua_State* L, int status, lua_KContext ctx) {
             for (int i = 0; i < header_name_length; ++i)
               header_start[i] = tolower(header_start[i]);
             if (strncmp(header_start, "content-length", 14) == 0)
-              request->body_length = atoi(value_offset);
+              request->body_length = atoi(value_offset + 1);
             lua_pushlstring(L, header_start, header_name_length);
             for (value_offset = value_offset + 1; *value_offset == ' '; ++value_offset);
             lua_pushlstring(L, value_offset, header_end - value_offset);
@@ -338,10 +338,10 @@ static int www_requestk(lua_State* L, int status, lua_KContext ctx) {
             header_start = header_end + 2;
           }
           lua_setfield(L, -2, "headers");
-          size_t header_length = request->chunk_length - (header_start - request->chunk);
+          size_t header_length = header_start - request->chunk;
           memmove(request->chunk, header_start, request->chunk_length - header_length);
           request->chunk_length -= header_length;
-          request->body_transmitted = request->chunk_length - header_length;
+          request->body_transmitted = 0;
           request->state = REQUEST_STATE_RECV_BODY;
           lua_pop(L, 1);
         // deliberate fallthrough.
@@ -357,6 +357,7 @@ static int www_requestk(lua_State* L, int status, lua_KContext ctx) {
                 strncpy(request->chunk, err, sizeof(request->chunk));
                 request->state = REQUEST_STATE_ERROR;
               }
+              request->body_transmitted += request->chunk_length;
               request->chunk_length = 0;
             } else {
               lua_pop(L, 1);
@@ -371,6 +372,7 @@ static int www_requestk(lua_State* L, int status, lua_KContext ctx) {
               lua_pushlstring(L, request->chunk, request->chunk_length);
               int n = lua_objlen(L, -2) + 1;
               lua_rawseti(L, -2, n);
+              request->body_transmitted += request->chunk_length;
               request->chunk_length = 0;
               lua_pop(L, 2);
             }
@@ -649,10 +651,8 @@ static int check_request(request_t* request) {
         if (bytes_read < 0) {
           request->state = REQUEST_STATE_ERROR;
           return 0;
-        } else if (bytes_read > 0) {
+        } else if (bytes_read > 0)
           request->chunk_length += bytes_read;
-          request->body_transmitted += bytes_read;
-        }
       }
     break;
     case REQUEST_STATE_RECV_PROCESS_HEADERS: break;
