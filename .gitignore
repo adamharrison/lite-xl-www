@@ -2,3 +2,4 @@ lib/prefix
 error.txt
 test.lua
 *.so
+bin

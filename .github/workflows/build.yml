@@ -1,0 +1,45 @@
+name: CI
+on: { push: { branches: [main] } }
+permissions:
+  contents: write
+jobs:
+  build_linux_windows_android:
+    runs-on: ubuntu-latest
+    defaults: { run: { shell: bash } }
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+        with: { fetch-depth: 0 }
+      - name: Clone Submodules
+        run: git submodule update --init --depth=1
+      # - uses: nttld/setup-ndk@v1
+      #   id: setup-ndk
+      #   with:
+      #     ndk-version: r21e
+      #     add-to-path: false
+      #     local-cache: true
+      - name: Build Libraries
+        env: { ANDROID_NDK_HOME: "${{ steps.setup-ndk.outputs.ndk-path }}", GITHUB_TOKEN: "${{ github.token }}" }
+        run: |
+          git config --global user.name "Github Actions" && git config --global user.email "adamdharrison@gmail.com"
+          sudo apt-get install -y gcc-multilib mingw-w64 && mkdir bin
+          ./build.sh clean && BIN="bin/www.x86_64-linux.so" ./build.sh &&
+          ./build.sh clean && CFLAGS="-m32" BIN="bin/www.x86-linux.so" ./build.sh &&
+          ./build.sh clean && BIN=bin/www.x86_64-windows.dll CC=x86_64-w64-mingw32-gcc AR=x86_64-w64-mingw32-gcc-ar \
+              CMAKE_DEFAULT_FLAGS="-DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=NEVER -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DCMAKE_SYSTEM_NAME=Windows" ./build.sh
+          ./build.sh clean && BIN=bin/www.x86-windows.dll CC=i686-w64-mingw32-gcc AR=i686-w64-mingw32-gcc-ar \
+              CMAKE_DEFAULT_FLAGS="-DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=NEVER -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DCMAKE_SYSTEM_NAME=Windows" ./build.sh
+          if [[ `git tag --points-at HEAD | head -c 1` == "v" ]]; then
+            export VERSION=`git describe --tags --abbrev=0 --match "v*" | tail -c +2`
+            gh release delete -y v$VERSION || true;
+            gh release create -t v$VERSION v$VERSION bin/*.so bin/*.dll
+            gh release delete -y latest || true;
+            gh release create -t latest latest bin/*.so bin/*.dll
+            git branch -f latest HEAD
+            git tag -f latest
+            git push -f origin refs/heads/latest
+            git push -f origin refs/tags/latest
+          fi
+
+
+

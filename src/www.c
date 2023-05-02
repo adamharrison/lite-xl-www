@@ -108,7 +108,7 @@ static int lock_mutex(mutex_t* mutex) {
 
 static int unlock_mutex(mutex_t* mutex) {
   #if _WIN32
-    ReleaseMutex(mutex->mutex)
+    ReleaseMutex(mutex->mutex);
   #else
     pthread_mutex_unlock(&mutex->mutex);
   #endif
@@ -196,14 +196,18 @@ static mutex_t* www_mutex;
 static request_t* request_queue;
 static char default_user_agent_string[] = "lite-xl-www/" WWW_VERSION;
 
-
+#ifndef min
 static int min(int a, int b) { return a < b ? a : b; }
+#endif
+
 static int lua_objlen(lua_State* L, int idx) {
   lua_len(L, idx);
   int n = lua_tointeger(L, -1);
   lua_pop(L, 1);
   return n;
 }
+
+#ifndef _WIN32
 static int strnicmp(const char* a, const char* b, int n) {
   for (int i = 0; i < n; ++i) {
     int difference = tolower(b[i]) - tolower(a[i]);
@@ -221,6 +225,7 @@ static int stricmp(const char* a, const char* b) {
   int cmp = strnicmp(a, b, min(lena, lenb));
   return cmp == 0 && lena != lenb ? (lena < lenb ? -1 : 1) : cmp;
 }
+#endif
 
 static request_t* request_enqueue(const char* hostname, unsigned short port, const char* header, int header_length, int content_length, int is_ssl, int is_get, int verbose) {
   lock_mutex(www_mutex);
@@ -294,7 +299,7 @@ static int www_requestk(lua_State* L, int status, lua_KContext ctx) {
         case REQUEST_STATE_SEND_BODY:
           lua_getfield(L, 1, "body");
           switch (lua_type(L, -1)) {
-            case LUA_TSTRING:
+            case LUA_TSTRING: {
               size_t body_length;
               const char* buffer = lua_tolstring(L, -1, &body_length);
               int chunk_length = min(sizeof(request->chunk) - request->chunk_length, body_length - request->body_transmitted);
@@ -303,7 +308,7 @@ static int www_requestk(lua_State* L, int status, lua_KContext ctx) {
                 request->chunk_length += chunk_length;
                 request->body_transmitted += chunk_length;
               }
-            break;
+            } break;
             case LUA_TFUNCTION:
             default: {
               lua_pushfstring(L, "error transmitting body; body must be either a string or a callback function", lua_typename(L, lua_type(L, -1))); has_error = 1;
@@ -591,7 +596,7 @@ static int request_socket_read(request_t* request, char* buf, int len) {
 
 static int check_request(request_t* request) {
   switch (request->state) {
-    case REQUEST_STATE_INIT:
+    case REQUEST_STATE_INIT: {
       char err[1024] = {0};
       if (request->is_ssl) {
         int status;
@@ -620,8 +625,13 @@ static int check_request(request_t* request) {
           goto cleanup;
         }
         int s = socket(AF_INET, SOCK_STREAM, 0);
-        int flags = fcntl(s, F_GETFL, 0);
-        fcntl(s, F_SETFL, flags | O_NONBLOCK);
+        #ifndef _WIN32
+          int flags = fcntl(s, F_GETFL, 0);
+          fcntl(s, F_SETFL, flags | O_NONBLOCK);
+        #else
+          u_long mode = 1;
+          ioctlsocket(s, FIONBIO, &mode);
+        #endif
         dest_addr.sin_family = AF_INET;
         dest_addr.sin_port = htons(request->port);
         dest_addr.sin_addr.s_addr = *(long*)(host->h_addr);
@@ -641,7 +651,7 @@ static int check_request(request_t* request) {
         } else {
           request->state = REQUEST_STATE_SEND_HEADERS;
         }
-    break;
+    } break;
     case REQUEST_STATE_SEND_HEADERS:
     case REQUEST_STATE_SEND_BODY:
       if (request->chunk_length > 0) {
@@ -674,7 +684,7 @@ static int check_request(request_t* request) {
         }
       }
     break;
-    case REQUEST_STATE_RECV_HEADERS:
+    case REQUEST_STATE_RECV_HEADERS: {
       int bytes_read = request_socket_read(request, &request->chunk[request->chunk_length], sizeof(request->chunk) - request->chunk_length);
       if (bytes_read < 0) {
         request->state = REQUEST_STATE_ERROR;
@@ -687,7 +697,7 @@ static int check_request(request_t* request) {
         if (boundary)
           request->state = REQUEST_STATE_RECV_PROCESS_HEADERS;
       }
-    break;
+    } break;
     case REQUEST_STATE_RECV_BODY:
       if (sizeof(request->chunk) - request->chunk_length > 0) {
         int bytes_read = request_socket_read(request, &request->chunk[request->chunk_length], sizeof(request->chunk) - request->chunk_length);
@@ -732,6 +742,58 @@ static void www_tls_debug(void *ctx, int level, const char *file, int line, cons
   fprintf(stderr, "%s:%04d: |%d| %s", file, line, level, str);
   fflush(stderr);
 }
+
+
+#if _WIN32
+static LPCWSTR lua_toutf16(lua_State* L, const char* str) {
+  if (str && str[0] == 0)
+    return L"";
+  int len = MultiByteToWideChar(CP_UTF8, 0, str, -1, NULL, 0);
+  if (len > 0) {
+    LPWSTR output = (LPWSTR) malloc(sizeof(WCHAR) * len);
+    if (output) {
+      len = MultiByteToWideChar(CP_UTF8, 0, str, -1, output, len);
+      if (len > 0) {
+        lua_pushlstring(L, (char*)output, len * 2);
+        free(output);
+        return (LPCWSTR)lua_tostring(L, -1);
+      }
+      free(output);
+    }
+  }
+  luaL_error(L, "can't convert utf8 string");
+  return NULL;
+}
+
+static const char* lua_toutf8(lua_State* L, LPCWSTR str) {
+  int len = WideCharToMultiByte(CP_UTF8, 0, str, -1, NULL, 0, NULL, NULL);
+  if (len > 0) {
+    char* output = (char *) malloc(sizeof(char) * len);
+    if (output) {
+      len = WideCharToMultiByte(CP_UTF8, 0, str, -1, output, len, NULL, NULL);
+      if (len) {
+        lua_pushlstring(L, output, len);
+        free(output);
+        return lua_tostring(L, -1);
+      }
+      free(output);
+    }
+  }
+  luaL_error(L, "can't convert utf16 string");
+  return NULL;
+}
+#endif
+
+static FILE* lua_fopen(lua_State* L, const char* path, const char* mode) {
+  #ifdef _WIN32
+    FILE* file = _wfopen(lua_toutf16(L, path), lua_toutf16(L, mode));
+    lua_pop(L, 2);
+    return file;
+  #else
+    return fopen(path, mode);
+  #endif
+}
+
 
 static int ssl_initialized;
 static int f_www_ssl(lua_State* L) {
