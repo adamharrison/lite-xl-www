@@ -9,6 +9,7 @@
   #include <arpa/inet.h>
   #include <unistd.h>
 #endif
+#include <stdlib.h>
 #include <ctype.h>
 #include <time.h>
 #include <string.h>
@@ -172,6 +173,7 @@ typedef struct request_t {
   int is_ssl;
   int body_length;
   int body_transmitted;
+  int verbose;
   time_t last_activity;
   unsigned short port;
   request_type_e state;
@@ -215,19 +217,19 @@ static int lua_objlen(lua_State* L, int idx) {
   return n;
 }
 
-static request_t* request_enqueue(const char* hostname, unsigned short port, const char* header, int header_length, int is_ssl) {
+static request_t* request_enqueue(const char* hostname, unsigned short port, const char* header, int header_length, int is_ssl, int is_get, int verbose) {
   lock_mutex(www_mutex);
-  request_t* request = malloc(sizeof(request_t));
+  request_t* request = calloc(sizeof(request_t), 1);
   request->socket = -1;
   strncpy(request->hostname, hostname, MAX_HOSTNAME_SIZE);
   strncpy(request->chunk, header, min(header_length, MAX_REQUEST_HEADER_SIZE));
   request->chunk_length = header_length;
   request->is_ssl = is_ssl;
+  request->is_get = is_get;
   request->state = REQUEST_STATE_INIT;
   request->body_length = -1;
   request->port = port;
-  request->prev = NULL;
-  request->next = NULL;
+  request->verbose = verbose;
   if (is_ssl) {
     mbedtls_ssl_init(&request->ssl_context);
     mbedtls_net_init(&request->net_context);
@@ -245,7 +247,6 @@ static request_t* request_enqueue(const char* hostname, unsigned short port, con
 
 
 static void request_complete(request_t* request) {
-  lock_mutex(www_mutex);
   if (request->prev)
     request->prev->next = request->next;
   else
@@ -259,7 +260,6 @@ static void request_complete(request_t* request) {
   if (request->socket != -1)
     close(request->socket);
   free(request);
-  unlock_mutex(www_mutex);
 }
 
 static int www_requestk(lua_State* L, int status, lua_KContext ctx) {
@@ -268,6 +268,7 @@ static int www_requestk(lua_State* L, int status, lua_KContext ctx) {
     lua_rawgeti(L, LUA_REGISTRYINDEX, (int)ctx);
   request_response_table_index = lua_gettop(L);
   lua_getfield(L, request_response_table_index, "request");
+  luaL_checktype(L, -1, LUA_TLIGHTUSERDATA);
   int has_error = 0;
   request_t* request = (request_t*)lua_touserdata(L, -1);
   do {
@@ -285,30 +286,36 @@ static int www_requestk(lua_State* L, int status, lua_KContext ctx) {
             break;
             case LUA_TFUNCTION:
             default: {
-              lua_pushfstring(L, "error transmitting body: %s", request->chunk); has_error = 1;
+              lua_pushfstring(L, "error transmitting body; body must be either a string or a callback function", lua_typename(L, lua_type(L, -1))); has_error = 1;
               goto error;
             }
           }
+          lua_pop(L, 1);
         break;
         case REQUEST_STATE_RECV_PROCESS_HEADERS: {
-          int code;
-          char status_line[128];
-          if (sscanf(request->chunk, "HTTP/1.1 %d %128s\r\n", &code, status_line) < 2) {
+          const char* code_delim = strpbrk(request->chunk, " ");
+          const char* status_delim = code_delim ? strpbrk(code_delim + 1, " ") : NULL;
+          const char* eol = status_delim ? strstr(status_delim + 1, "\r\n") : NULL;
+          if (!code_delim || !status_delim || strncmp(request->chunk, "HTTP/1.1", 8) != 0 || !eol) {
             lua_pushfstring(L, "error processing headers: %s", request->chunk); has_error = 1;
             goto error;
           }
+          int code = atoi(code_delim + 1);
+          char status_line[128];
+          strncpy(status_line, status_delim + 1, min(eol - status_delim - 1, sizeof(status_line)));
           lua_getfield(L, request_response_table_index, "response");
           lua_pushinteger(L, code);
-          lua_setfield(L, -1, "code");
+          lua_setfield(L, -2, "code");
           lua_pushstring(L, status_line);
-          lua_setfield(L, -1, "status");
+          lua_setfield(L, -2, "status");
           lua_newtable(L);
           char* header_start = strstr(request->chunk, "\r\n") + 2;
           while (1) {
             if (header_start) {
-              header_start += 2;
-              if (header_start[0] == '\r' && header_start[1] == '\n')
+              if (header_start[0] == '\r' && header_start[1] == '\n') {
+                header_start += 2;
                 break;
+              }
             }
             char* value_offset = strstr(header_start, ":");
             char* header_end = strstr(header_start, "\r\n");
@@ -322,19 +329,24 @@ static int www_requestk(lua_State* L, int status, lua_KContext ctx) {
             if (strncmp(header_start, "content-length", 14) == 0)
               request->body_length = atoi(value_offset);
             lua_pushlstring(L, header_start, header_name_length);
-            lua_pushlstring(L, value_offset + 1, header_end - value_offset);
+            for (value_offset = value_offset + 1; *value_offset == ' '; ++value_offset);
+            lua_pushlstring(L, value_offset, header_end - value_offset);
             lua_rawset(L, -3);
-            header_start = header_end;
+            header_start = header_end + 2;
           }
-          lua_setfield(L, -1, "headers");
-          lua_pop(L, 1);
+          lua_setfield(L, -2, "headers");
+          size_t header_length = request->chunk_length - (header_start - request->chunk);
+          memmove(request->chunk, header_start, header_length);
+          request->chunk_length -= header_length;
+          request->body_transmitted = request->chunk_length;
           request->state = REQUEST_STATE_RECV_BODY;
-        break;
+          lua_pop(L, 1);
+        // deliberate fallthrough.
         case REQUEST_STATE_RECV_BODY:
           if (request->chunk_length) {
             lua_getfield(L, request_response_table_index, "callback");
             if (lua_type(L, -1) == LUA_TFUNCTION) {
-              lua_getfield(L, 1, "response");
+              lua_getfield(L, request_response_table_index, "response");
               lua_pushlstring(L, request->chunk, request->chunk_length);
               if (lua_pcall(L, 2, 0, 0)) {
                 size_t len;
@@ -351,51 +363,62 @@ static int www_requestk(lua_State* L, int status, lua_KContext ctx) {
                 lua_pop(L, 1);
                 lua_newtable(L);
                 lua_pushvalue(L, -1);
-                lua_setfield(L, 1, "response");
+                lua_setfield(L, -3, "body");
               }
               lua_pushlstring(L, request->chunk, request->chunk_length);
               lua_rawseti(L, -2, lua_objlen(L, -2) + 1);
               request->chunk_length = 0;
               lua_pop(L, 2);
             }
-            if (request->body_transmitted >= request->body_length)
-              request->state = REQUEST_STATE_RECV_COMPLETE;
           }
-        } break;
-        case REQUEST_STATE_RECV_COMPLETE: {
-          lua_getfield(L, request_response_table_index, "response");
-          lua_getfield(L, -1, "body");
-          if (lua_type(L, -1) == LUA_TTABLE) {
-            luaL_Buffer b;
-            luaL_buffinit(L, &b);
-            int n = lua_objlen(L, -1);
-            for (int i = 1; i <= n; n++) {
-              lua_rawgeti(L, i, -1);
-              size_t len;
-              const char* chunk = lua_tolstring(L, -1, &len);
-              luaL_addlstring(&b, chunk, len);
-              lua_pop(L, 1);
+          if (request->body_transmitted >= request->body_length) {
+            lua_getfield(L, request_response_table_index, "response");
+            lua_getfield(L, -1, "body");
+            if (lua_type(L, -1) == LUA_TTABLE) {
+              int n = lua_objlen(L, -1);
+              luaL_Buffer b;
+              luaL_buffinit(L, &b);
+              for (int i = 1; i <= n; ++i) {
+                lua_rawgeti(L, -1, i);
+                size_t len;
+                const char* chunk = lua_tolstring(L, -1, &len);
+                luaL_addlstring(&b, chunk, len);
+                lua_pop(L, 1);
+              }
+              luaL_pushresult(&b);
+              lua_setfield(L, -3, "body");
             }
-            luaL_pushresult(&b);
-            lua_setfield(L, -2, "body");
+            lua_pop(L, 2);
+            request->state = REQUEST_STATE_RECV_COMPLETE;
           }
         } break;
         default: break;
       }
     error:
-      unlock_mutex(www_mutex);
+    unlock_mutex(www_mutex);
+    if (has_error) {
+      size_t len;
+      strncpy(request->chunk, lua_tolstring(L, -1, &len), sizeof(request->chunk));
+      request->chunk_length = min(len, sizeof(request->chunk));
+      request->state = REQUEST_STATE_ERROR;
+    }
     if (!ctx)
       sleep_in_miliseconds(1);
   } while (!ctx && request->state != REQUEST_STATE_RECV_COMPLETE && request->state != REQUEST_STATE_ERROR);
   if (request->state == REQUEST_STATE_RECV_COMPLETE) {
+    lock_mutex(www_mutex);
     request_complete(request);
+    unlock_mutex(www_mutex);
     if (ctx)
       luaL_unref(L, LUA_REGISTRYINDEX, (int)ctx);
     lua_getfield(L, request_response_table_index, "response");
     return 1;
   } else if (request->state == REQUEST_STATE_ERROR) {
+    lua_pop(L, 1);
     lua_pushfstring(L, "error in request: %s", request->chunk);
+    lock_mutex(www_mutex);
     request_complete(request);
+    unlock_mutex(www_mutex);
     return lua_error(L);
   } else {
     lua_pushnumber(L, YIELD_TIMEOUT);
@@ -407,8 +430,8 @@ static int www_requestk(lua_State* L, int status, lua_KContext ctx) {
 static int f_www_request(lua_State* L) {
   long response_code;
   char method[MAX_METHOD_SIZE];
-  char protocol[MAX_PROTOCOL_SIZE];
-  char hostname[MAX_HOSTNAME_SIZE];
+  char protocol[MAX_PROTOCOL_SIZE] = {0};
+  char hostname[MAX_HOSTNAME_SIZE] = {0};
   char path[MAX_PATH_SIZE] = "/";
   char err[MAX_ERROR_SIZE] = {0};
   char header[MAX_REQUEST_HEADER_SIZE];
@@ -416,36 +439,63 @@ static int f_www_request(lua_State* L) {
 
   lua_getfield(L, 1, "url");
   const char* url = luaL_checkstring(L, -1);
-  if (sscanf("%10s://%128s/%s", protocol, hostname, path) < 2)
-    return luaL_error(L, "unable to parse URL %s", url);
+
+  char* delim;
+
+  if (!(delim = strpbrk(url, ":")) || (delim - url) >= 5)
+    goto url_error;
+  strncpy(protocol, url, (delim - url));
+  if (strncmp(&delim[1], "//", 2) != 0)
+    goto url_error;
+  delim += 3;
+  char* hostname_delim;
+  if ((hostname_delim = strpbrk(delim, "/"))) {
+    strncpy(hostname, delim, min(sizeof(hostname), hostname_delim - delim));
+    strncpy(path, hostname_delim, sizeof(path));
+  } else
+    strncpy(hostname, delim, sizeof(hostname));
+
+  url_error:
+  if (!protocol[0] || !hostname[0] || !path[0])
+      return luaL_error(L, "unable to parse URL %s", url);
   if (strcmp(protocol, "http") != 0 && strcmp(protocol, "https") != 0)
     return luaL_error(L, "unrecognized protocol");
+
+  lua_pop(L, 1);
+  lua_getfield(L, 1, "verbose");
+  int verbose = lua_toboolean(L, -1);
   lua_pop(L, 1);
 
   lua_getfield(L, 1, "body");
-  int has_body = lua_isnil(L, -1);
+  int has_body = !lua_isnil(L, -1);
   lua_pop(L,1);
   lua_getfield(L, 1, "method");
-  if (lua_isnil(L, -1))
+  if (!lua_isnil(L, -1))
     strncpy(method, luaL_checkstring(L, -1), sizeof(method));
   else
     strcpy(method, has_body ? "POST" : "GET");
   lua_pop(L, 1);
 
+  int is_get = strcmp(method, "GET") == 0;
+
   int header_offset = snprintf(header, sizeof(header), "%s %s %s\r\n", method, path, version);
   lua_getfield(L, 1, "headers");
-  lua_pushnil(L);
-  while (lua_next(L, -2)) {
-    if (header_offset < sizeof(header))
-      header_offset += snprintf(&header[header_offset], sizeof(header) - header_offset, "%s: %s\r\n", luaL_checkstring(L, -2), lua_tostring(L, -1));
-    lua_pop(L, 1);
+  if (!lua_isnil(L, -1)) {
+    lua_pushnil(L);
+    while (lua_next(L, -2)) {
+      if (header_offset < sizeof(header))
+        header_offset += snprintf(&header[header_offset], sizeof(header) - header_offset, "%s: %s\r\n", luaL_checkstring(L, -2), lua_tostring(L, -1));
+      lua_pop(L, 1);
+    }
   }
+  lua_pop(L, 1);
+  header_offset += snprintf(&header[header_offset], sizeof(header) - header_offset, "Host: %s\r\n", hostname);
   header[header_offset++] = '\r';
   header[header_offset++] = '\n';
   header[header_offset++] = 0;
   int is_ssl = strcmp(protocol, "https") == 0;
   unsigned short port = is_ssl ? 443 : 80;
-  request_t* request = request_enqueue(hostname, port, header, header_offset, is_ssl);
+  request_t* request = request_enqueue(hostname, port, header, header_offset, is_ssl, is_get, verbose);
   lua_pushlightuserdata(L, request);
   lua_setfield(L, 1, "request");
   lua_newtable(L);
@@ -477,6 +527,7 @@ static int mbedtls_snprintf(int mbedtls, char* buffer, int len, int status, cons
   return strlen(buffer);
 }
 
+
 static int request_socket_write(request_t* request, const char* buf, int len) {
   return request->is_ssl ? mbedtls_ssl_write(&request->ssl_context, buf, len) : write(request->socket, buf, len);
 }
@@ -493,7 +544,7 @@ static int check_request(request_t* request) {
       if (request->is_ssl) {
         int status;
         char port[10];
-        snprintf(port, sizeof(char), "%d", request->port);
+        snprintf(port, sizeof(port), "%d", (int)request->port);
         // https://gist.github.com/Barakat/675c041fd94435b270a25b5881987a30
         if ((status = mbedtls_ssl_setup(&request->ssl_context, &ssl_config)) != 0) {
           mbedtls_snprintf(1, err, sizeof(err), status, "can't set up ssl for %s: %d", request->hostname, status); goto cleanup;
@@ -573,6 +624,7 @@ static int check_request(request_t* request) {
         return 0;
       }
       if (bytes_read > 0) {
+        request->chunk_length += bytes_read;
         const char* boundary = strstr(request->chunk, "\r\n\r\n");
         if (boundary)
           request->state = REQUEST_STATE_RECV_PROCESS_HEADERS;
@@ -585,6 +637,7 @@ static int check_request(request_t* request) {
           request->state = REQUEST_STATE_ERROR;
           return 0;
         } else if (bytes_read > 0) {
+          request->chunk_length += bytes_read;
           request->body_transmitted += bytes_read;
         }
       }
@@ -597,7 +650,7 @@ static int check_request(request_t* request) {
 static void* www_request_thread_callback(void* data) {
   while (1) {
     lock_mutex(www_mutex);
-    int should_exit = request_queue != NULL;
+    int should_exit = request_queue == NULL;
     if (should_exit) {
       www_thread = NULL;
       unlock_mutex(www_mutex);
@@ -608,6 +661,8 @@ static void* www_request_thread_callback(void* data) {
       check_request(request);
       request = request->next;
     }
+    unlock_mutex(www_mutex);
+    sleep_in_miliseconds(1);
   }
   return NULL;
 }
@@ -714,7 +769,7 @@ static int f_www_ssl(lua_State* L) {
 }
 
 
-static int f_www_release(lua_State* L) {
+static int f_www_gc(lua_State* L) {
   lock_mutex(www_mutex);
   request_t* request = request_queue;
   while (request) {
@@ -737,7 +792,7 @@ static luaL_Reg www_api[] = {
   { "request",  f_www_request },
   // { "get",      f_www_get     },
   { "ssl",      f_www_ssl     },
-  { "__gc",     f_www_release },
+  { "__gc",     f_www_gc },
   { NULL, NULL }
 };
 
