@@ -28,8 +28,9 @@ See below an example:
 local www = require "www"
 
 core.add_thread(function()
-  print(www.get("https://google.com"))
-  print(www.post("https://google.com", "q=test"))
+  local agent = www.new()
+  print(agent:get("https://google.com"))
+  print(agent:post("https://google.com", "q=test"))
 end)
 ```
 
@@ -38,6 +39,9 @@ end)
 For a more nitty-gritty experience, you can use the core method `raw`, which
 uses a stateless interface, and will return you the raw request of what you
 request, no redirection, decoding, or anything else.
+
+The only shared state present is the underlying queue that handles making
+the requests, and the SSL configuration. Everything else is stateless.
 
 ```lua
 local www = require "www"

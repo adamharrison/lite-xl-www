@@ -8,6 +8,7 @@
   #include <sys/socket.h>
   #include <arpa/inet.h>
   #include <unistd.h>
+  #include <fcntl.h>
 #endif
 #include <stdlib.h>
 #include <ctype.h>
@@ -180,6 +181,7 @@ typedef struct request_t {
   int body_transmitted;
   int verbose;
   time_t last_activity;
+  int timeout_length;
   unsigned short port;
   request_type_e state;
   mbedtls_net_context net_context;
@@ -204,7 +206,7 @@ static int lua_objlen(lua_State* L, int idx) {
 }
 static int strnicmp(const char* a, const char* b, int n) {
   for (int i = 0; i < n; ++i) {
-    int difference = b[i] - a[i];
+    int difference = tolower(b[i]) - tolower(a[i]);
     if (!difference) {
       if (!a[i])
         break;
@@ -220,7 +222,7 @@ static int stricmp(const char* a, const char* b) {
   return cmp == 0 && lena != lenb ? (lena < lenb ? -1 : 1) : cmp;
 }
 
-static request_t* request_enqueue(const char* hostname, unsigned short port, const char* header, int header_length, int is_ssl, int is_get, int verbose) {
+static request_t* request_enqueue(const char* hostname, unsigned short port, const char* header, int header_length, int content_length, int is_ssl, int is_get, int verbose) {
   lock_mutex(www_mutex);
   request_t* request = calloc(sizeof(request_t), 1);
   request->socket = -1;
@@ -230,7 +232,9 @@ static request_t* request_enqueue(const char* hostname, unsigned short port, con
   request->is_ssl = is_ssl;
   request->is_get = is_get;
   request->state = REQUEST_STATE_INIT;
-  request->body_length = -1;
+  request->timeout_length = MAX_TIMEOUT;
+  request->last_activity = time(NULL);
+  request->body_length = content_length;
   request->port = port;
   request->verbose = verbose;
   if (is_ssl) {
@@ -282,10 +286,14 @@ static int www_requestk(lua_State* L, int status, lua_KContext ctx) {
           lua_getfield(L, 1, "body");
           switch (lua_type(L, -1)) {
             case LUA_TSTRING:
-              size_t len;
-              const char* buffer = lua_tolstring(L, -1, &len);
-              request->body_length = len;
-              memcpy(&request->chunk[request->chunk_length], &buffer[request->body_transmitted], min(sizeof(request->chunk) - request->chunk_length, len - request->body_transmitted));
+              size_t body_length;
+              const char* buffer = lua_tolstring(L, -1, &body_length);
+              int chunk_length = min(sizeof(request->chunk) - request->chunk_length, body_length - request->body_transmitted);
+              if (chunk_length > 0) {
+                memcpy(&request->chunk[request->chunk_length], &buffer[request->body_transmitted], chunk_length);
+                request->chunk_length += chunk_length;
+                request->body_transmitted += chunk_length;
+              }
             break;
             case LUA_TFUNCTION:
             default: {
@@ -467,11 +475,17 @@ static int f_www_request(lua_State* L) {
 
   lua_pop(L, 1);
   lua_getfield(L, 1, "verbose");
-  int verbose = lua_toboolean(L, -1);
+  int verbose = lua_tointeger(L, -1);
   lua_pop(L, 1);
 
   lua_getfield(L, 1, "body");
   int has_body = !lua_isnil(L, -1);
+  int preset_content_length = -1;
+  if (lua_isstring(L, -1)) {
+    size_t len;
+    lua_tolstring(L, -1, &len);
+    preset_content_length = len;
+  }
   lua_pop(L,1);
   lua_getfield(L, 1, "method");
   if (!lua_isnil(L, -1))
@@ -485,6 +499,8 @@ static int f_www_request(lua_State* L) {
   int header_offset = snprintf(header, sizeof(header), "%s %s %s\r\n", method, path, version);
   int has_host_header = 0;
   int has_user_agent_header = 0;
+  int has_content_length = 0;
+  int has_content_type = 0;
   lua_getfield(L, 1, "headers");
   if (!lua_isnil(L, -1)) {
     lua_pushnil(L);
@@ -493,8 +509,12 @@ static int f_www_request(lua_State* L) {
         const char* header_name = luaL_checkstring(L, -2);
         if (stricmp(header_name, "user-agent") == 0)
           has_user_agent_header = 1;
-        if (stricmp(header_name, "host") == 0)
+        else if (stricmp(header_name, "host") == 0)
           has_host_header = 1;
+        else if (stricmp(header_name, "content-length") == 0)
+          has_content_length = 1;
+        else if (stricmp(header_name, "content-type") == 0)
+          has_content_length = 1;
         header_offset += snprintf(&header[header_offset], sizeof(header) - header_offset, "%s: %s\r\n", header_name, lua_tostring(L, -1));
       }
       lua_pop(L, 1);
@@ -505,12 +525,22 @@ static int f_www_request(lua_State* L) {
     header_offset += snprintf(&header[header_offset], sizeof(header) - header_offset, "Host: %s\r\n", hostname);
   if (!has_user_agent_header)
     header_offset += snprintf(&header[header_offset], sizeof(header) - header_offset, "User-Agent: %s\r\n", default_user_agent_string);
+  if (!has_content_length && has_body) {
+    if (preset_content_length == -1)
+      return luaL_error(L, "in order to make a request with a body callback function, please specify the 'content-length' as a header.");
+    header_offset += snprintf(&header[header_offset], sizeof(header) - header_offset, "Content-Length: %d\r\n", preset_content_length);
+  }
+  if (has_body && !has_content_type)
+    header_offset += snprintf(&header[header_offset], sizeof(header) - header_offset, "Content-Type: application/x-www-form-urlencoded\r\n");
+
   header[header_offset++] = '\r';
   header[header_offset++] = '\n';
-  header[header_offset++] = 0;
+  header[header_offset + 1] = 0;
   int is_ssl = strcmp(protocol, "https") == 0;
   unsigned short port = is_ssl ? 443 : 80;
-  request_t* request = request_enqueue(hostname, port, header, header_offset, is_ssl, is_get, verbose);
+  if (verbose == 1)
+    fprintf(stderr, "%s %s://%s%s\n", method, protocol, hostname, path);
+  request_t* request = request_enqueue(hostname, port, header, header_offset, preset_content_length, is_ssl, is_get, verbose);
   lua_pushlightuserdata(L, request);
   lua_setfield(L, 1, "request");
   lua_newtable(L);
@@ -583,15 +613,8 @@ static int check_request(request_t* request) {
           goto cleanup;
         }
         int s = socket(AF_INET, SOCK_STREAM, 0);
-        #ifdef _WIN32
-          DWORD timeout = 5 * 1000;
-          setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof timeout);
-        #else
-          struct timeval tv;
-          tv.tv_sec = 5;
-          tv.tv_usec = 0;
-          setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof tv);
-        #endif
+        int flags = fcntl(s, F_GETFL, 0);
+        fcntl(s, F_SETFL, flags | O_NONBLOCK);
         dest_addr.sin_family = AF_INET;
         dest_addr.sin_port = htons(request->port);
         dest_addr.sin_addr.s_addr = *(long*)(host->h_addr);
@@ -614,22 +637,34 @@ static int check_request(request_t* request) {
     break;
     case REQUEST_STATE_SEND_HEADERS:
     case REQUEST_STATE_SEND_BODY:
-      int bytes_written = request_socket_write(request, request->chunk, request->chunk_length);
-      if (bytes_written < 0) {
-        request->state = REQUEST_STATE_ERROR;
-        return 0;
-      }
-      if (bytes_written == request->chunk_length) {
-        request->chunk_length = 0;
-        if (request->state == REQUEST_STATE_SEND_HEADERS) {
-          if (!request->is_get)
-            request->state = REQUEST_STATE_SEND_BODY;
-          else
-            request->state = REQUEST_STATE_RECV_HEADERS;
+      if (request->chunk_length > 0) {
+        int bytes_written = request_socket_write(request, request->chunk, request->chunk_length);
+        if (bytes_written < 0) {
+          request->state = REQUEST_STATE_ERROR;
+          return 0;
         }
-      } else {
-        memmove(&request->chunk[bytes_written], request->chunk, request->chunk_length - bytes_written);
-        request->chunk_length -= bytes_written;
+        if (bytes_written == request->chunk_length) {
+          if (request->verbose == 2)
+            write(fileno(stderr), request->chunk, request->chunk_length);
+          request->last_activity = time(NULL);
+          request->chunk_length = 0;
+          if (request->state == REQUEST_STATE_SEND_HEADERS) {
+            if (!request->is_get)
+              request->state = REQUEST_STATE_SEND_BODY;
+            else
+              request->state = REQUEST_STATE_RECV_HEADERS;
+          }
+        } else if (bytes_written > 0) {
+          if (request->verbose == 2)
+            write(fileno(stderr), request->chunk, request->chunk_length);
+          request->last_activity = time(NULL);
+          memmove(&request->chunk[bytes_written], request->chunk, request->chunk_length - bytes_written);
+          request->chunk_length -= bytes_written;
+        }
+        if (request->state == REQUEST_STATE_SEND_BODY && request->body_transmitted == request->body_length) {
+          request->state = REQUEST_STATE_RECV_HEADERS;
+          request->body_transmitted = 0;
+        }
       }
     break;
     case REQUEST_STATE_RECV_HEADERS:
@@ -639,6 +674,7 @@ static int check_request(request_t* request) {
         return 0;
       }
       if (bytes_read > 0) {
+        request->last_activity = time(NULL);
         request->chunk_length += bytes_read;
         const char* boundary = strstr(request->chunk, "\r\n\r\n");
         if (boundary)
@@ -651,11 +687,17 @@ static int check_request(request_t* request) {
         if (bytes_read < 0) {
           request->state = REQUEST_STATE_ERROR;
           return 0;
-        } else if (bytes_read > 0)
+        } else if (bytes_read > 0) {
+          request->last_activity = time(NULL);
           request->chunk_length += bytes_read;
+        }
       }
     break;
     case REQUEST_STATE_RECV_PROCESS_HEADERS: break;
+  }
+  if (time(NULL) - request->last_activity > request->timeout_length && request->state != REQUEST_STATE_ERROR && request->state != REQUEST_STATE_RECV_COMPLETE) {
+    request->state = REQUEST_STATE_ERROR;
+    request->chunk_length = snprintf(request->chunk, sizeof(request->chunk), "%s", "request timed out");
   }
   return -1;
 }
@@ -678,6 +720,11 @@ static void* www_request_thread_callback(void* data) {
     sleep_in_miliseconds(1);
   }
   return NULL;
+}
+
+static void www_tls_debug(void *ctx, int level, const char *file, int line, const char *str) {
+  fprintf(stderr, "%s:%04d: |%d| %s", file, line, level, str);
+  fflush(stderr);
 }
 
 static int ssl_initialized;
@@ -708,11 +755,12 @@ static int f_www_ssl(lua_State* L) {
   mbedtls_ssl_conf_authmode(&ssl_config, MBEDTLS_SSL_VERIFY_REQUIRED);
   mbedtls_ssl_conf_rng(&ssl_config, mbedtls_ctr_drbg_random, &drbg_context);
   mbedtls_ssl_conf_read_timeout(&ssl_config, 5000);
+  int debug_level = luaL_checkinteger(L, 3);
   #if defined(MBEDTLS_DEBUG_C)
-  /*if (print_trace) {
-    mbedtls_debug_set_threshold(5);
-    //mbedtls_ssl_conf_dbg(&ssl_config, lpm_tls_debug, NULL);
-  }*/
+  if (debug_level) {
+    mbedtls_debug_set_threshold(debug_level);
+    mbedtls_ssl_conf_dbg(&ssl_config, www_tls_debug, NULL);
+  }
   #endif
   ssl_initialized = 1;
   if (strcmp(type, "noverify") == 0) {
@@ -807,34 +855,36 @@ static void www_merge_tables(lua_State* L) {
     lua_pushvalue(L, -2);
     lua_pushvalue(L, -2);
     lua_rawset(L, -5);
-    lua_pop(L, 2);
+    lua_pop(L, 1);
   }
 }
 
-static int www_method(const char* method, int has_body, lua_State* L) {
+static int f_www_agent_request(lua_State* L) {
   luaL_checktype(L, 1, LUA_TTABLE);
-  const char* url = luaL_checkstring(L, 2);
-  if (lua_gettop(L) == (has_body ? 3 : 2))
+  const char* method = luaL_checkstring(L, 2);
+  int has_body = stricmp(method, "GET") != 0;
+  const char* url = luaL_checkstring(L, 3);
+  if (lua_gettop(L) == (has_body ? 4 : 3))
     lua_newtable(L);
   if (has_body) {
-    luaL_checktype(L, 3, LUA_TSTRING);
-    luaL_checktype(L, 4, LUA_TTABLE);
+    luaL_checktype(L, 4, LUA_TSTRING);
+    luaL_checktype(L, 5, LUA_TTABLE);
   } else
-    luaL_checktype(L, 3, LUA_TTABLE);
+    luaL_checktype(L, 4, LUA_TTABLE);
   lua_getfield(L, 1, "options");
   lua_newtable(L);
   www_merge_tables(L);
   www_merge_tables(L);
   int request_parameters_index = lua_gettop(L);
   lua_pushliteral(L, "url");
-  lua_pushvalue(L, 2);
+  lua_pushvalue(L, 3);
   lua_rawset(L, request_parameters_index);
   lua_pushliteral(L, "method");
   lua_pushstring(L, method);
   lua_rawset(L, request_parameters_index);
   if (has_body) {
     lua_pushliteral(L, "body");
-    lua_pushvalue(L, 2);
+    lua_pushvalue(L, 4);
     lua_rawset(L, request_parameters_index);
   }
   lua_pushcfunction(L, f_www_request);
@@ -870,6 +920,10 @@ static int www_method(const char* method, int has_body, lua_State* L) {
         lua_replace(L, -2);
       }
       lua_setfield(L, request_parameters_index, "url");
+      lua_pushnil(L);
+      lua_setfield(L, request_parameters_index, "body");
+      lua_pushliteral(L, "GET");
+      lua_setfield(L, request_parameters_index, "method");
       lua_pop(L, 2);
       lua_pushcfunction(L, f_www_request);
       lua_pushvalue(L, request_parameters_index);
@@ -878,29 +932,76 @@ static int www_method(const char* method, int has_body, lua_State* L) {
       break;
   }
   // End redirect code.
+  lua_getfield(L, -1, "code");
+  int code = lua_tointeger(L, -1);
+  lua_pop(L, 1);
+  if (code >= 300)
+    return lua_error(L);
   lua_getfield(L, -1, "body");
   lua_pushvalue(L, -2);
   return 2;
 }
 
-static int f_www_get(lua_State* L)   { return www_method("GET", 0, L); }
-static int f_www_post(lua_State* L)   { return www_method("POST", 1, L); }
-static int f_www_put(lua_State* L)    { return www_method("PUT", 1, L); }
-static int f_www_delete(lua_State* L) { return www_method("DELETE", 1, L); }
+static int f_www_agent_get(lua_State* L)   {
+  lua_pushliteral(L, "GET");                  lua_insert(L, 2);
+  lua_pushcfunction(L, f_www_agent_request);  lua_insert(L, 1);
+  lua_call(L, lua_gettop(L) - 1, 2);
+  return 2;
+}
+static int f_www_agent_post(lua_State* L)   {
+  lua_pushliteral(L, "POST");                 lua_insert(L, 2);
+  lua_pushcfunction(L, f_www_agent_request);  lua_insert(L, 1);
+  lua_call(L, lua_gettop(L) - 1, 2);
+  return 2;
+}
+static int f_www_agent_put(lua_State* L)   {
+  lua_pushliteral(L, "PUT");                  lua_insert(L, 2);
+  lua_pushcfunction(L, f_www_agent_request);  lua_insert(L, 1);
+  lua_call(L, lua_gettop(L) - 1, 2);
+  return 2;
+}
+static int f_www_agent_delete(lua_State* L) {
+  lua_pushliteral(L, "DELETE");               lua_insert(L, 2);
+  lua_pushcfunction(L, f_www_agent_request);  lua_insert(L, 1);
+  lua_call(L, lua_gettop(L) - 1, 2);
+  return 2;
+}
 
-static luaL_Reg www_api[] = {
-  // Core functions, `request` is the primary function, and is stateless (minus the ssl config), and makes raw requests.
-  { "__gc",     f_www_gc      },
-  { "request",  f_www_request },    // { headers = table, body = string } = www.request({ url = string, body = string|function(), method = string|"GET", headers = table|{}, callback = nil|function(response, chunk), progress = function()|nil  })
-  { "ssl",      f_www_ssl     },    // www.ssl(type, path|nil)
-  // Utility functions; to set default options, set www.options, default set to { redirects = 10 }.
-  { "get",      f_www_get     },    // body, response = www:get(url, options|nil)
-  { "post",     f_www_post    },    // body, response = www:post(url, body, options|nil)
-  { "put",      f_www_put     },    // body, response = www:put(url, body, options|nil)
-  { "delete",   f_www_delete  },    // body, response = www:delete(url, body, options|nil)
-  { NULL, NULL }
+static int f_www_new(lua_State* L);
+
+ // Core functions, `request` is the primary function, and is stateless (minus the ssl config), and makes raw requests.
+static const luaL_Reg www_api[] = {
+  { "__gc",     f_www_gc      },    // private, reserved cleanup function for the global ssl state and request queue
+  { "request",  f_www_request },    // response = www.request({ url = string, body = string|function(), method = string|"GET", headers = table|{}, callback = nil|function(response, chunk), progress = function()|nil  })
+  { "ssl",      f_www_ssl     },    // www.ssl(type, path|nil, debug_level)
+  { "new",      f_www_new     },    // agent = www.new(options)
+  { NULL,       NULL          }
 };
 
+// Utility functions, when instantiated an agent keeps a cookie store, and provides some convenience methods.
+static const luaL_Reg www_agent_api[] = {
+  { "request",      f_www_agent_request },    // body, response = agent:request(method, url, options|nil)
+  { "get",          f_www_agent_get     },    // body, response = agent:get(url, options|nil)
+  { "post",         f_www_agent_post    },    // body, response = agent:post(url, body, options|nil)
+  { "put",          f_www_agent_put     },    // body, response = agent:put(url, body, options|nil)
+  { "delete",       f_www_agent_delete  },    // body, response = agent:delete(url, body, options|nil)
+  { NULL,           NULL                }
+};
+
+static int f_www_new(lua_State* L) {
+  int arguments = lua_gettop(L);
+  luaL_newlib(L, www_agent_api);
+  if (arguments > 0) {
+    luaL_checktype(L, 1, LUA_TTABLE);
+    lua_pushvalue(L, 1);
+  } else {
+    lua_newtable(L);
+  }
+  lua_setfield(L, -2, "options");
+  /*lua_newtable(L);
+  lua_setfield(L, -1, "cookies");*/
+  return 1;
+}
 
 #ifndef WWW_STANDALONE
 int luaopen_lite_xl_www(lua_State* L, void* XL) {
@@ -917,10 +1018,9 @@ int luaopen_www(lua_State* L) {
 #endif
   lua_pushliteral(L, "/ssl.certs");
   lua_concat(L, 2);
-  lua_call(L, 2, 0);
+  lua_pushinteger(L, 0);
+  lua_call(L, 3, 0);
   luaL_newlib(L, www_api);
-  lua_newtable(L);
-  lua_setfield(L, -2, "options");
   lua_pushvalue(L, -1);
   lua_setmetatable(L, -2);
   www_mutex = new_mutex();
