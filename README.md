@@ -25,7 +25,7 @@ This should spit out a shared library on linux, windows (msys2), macos and andro
 See below an example:
 
 ```lua
-local www = require "www"
+local www = require "libraries.www"
 
 core.add_thread(function()
   local agent = www.new()
@@ -44,7 +44,7 @@ The only shared state present is the underlying queue that handles making
 the requests, and the SSL configuration. Everything else is stateless.
 
 ```lua
-local www = require "www"
+local www = require "libraries.www"
 
 core.add_thread(function()
   local res = www.request({
@@ -64,7 +64,7 @@ In the case where you want to retrieve, or submit a large document, you can
 do things via chunks.
 
 ```lua
-local www = require "www"
+local www = require "libraries.www"
 
 core.add_thread(function()
   local f = io.open("mylargefile")
@@ -82,7 +82,7 @@ end)
 And, the inverse, for the download:
 
 ```lua
-local www = require "www"
+local www = require "libraries.www"
 
 core.add_thread(function()
   local f = io.open("mylargefile", "wb")

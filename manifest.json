@@ -2,6 +2,24 @@
   "addons": [{
     "id": "www",
     "type": "library",
-    "description": "A simple library that provides a web client to fetch, and submit data via HTTP requests."
+    "version": "0.1",
+    "description": "A simple library that provides a web client to fetch, and submit data via HTTP requests.",
+    "files": [{
+        "url": "https://github.com/adamharrison/lite-xl-www/releases/download/latest/www.x86-linux.so",
+        "arch": "x86-linux",
+        "checksum": "SKIP"
+    }, {
+        "url": "https://github.com/adamharrison/lite-xl-www/releases/download/latest/www.x86_64-linux.so",
+        "arch": "x86_64-linux",
+        "checksum": "SKIP"
+    } , {
+        "url": "https://github.com/adamharrison/lite-xl-www/releases/download/latest/www.x86-windows.dll",
+        "arch": "x86-windows",
+        "checksum": "SKIP"
+    }, {
+        "url": "https://github.com/adamharrison/lite-xl-www/releases/download/latest/www.x86_64-windows.dll",
+        "arch": "x86_64-windows",
+        "checksum": "SKIP"
+    }]
   }]
 }
