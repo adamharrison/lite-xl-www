@@ -2,6 +2,7 @@
   #include <direct.h>
   #include <winsock2.h>
   #include <windows.h>
+  #define usleep(x) Sleep((x)/1000)
 #else
   #include <pthread.h>
   #include <netdb.h>
@@ -37,10 +38,10 @@
 #endif
 
 
-#define MAX_REQUEST_HEADER_SIZE 4096
+#define MAX_REQUEST_HEADER_SIZE 4096 // This is also the max chunk size.
+#define MAX_PATH_SIZE 1024
 #define MAX_HOSTNAME_SIZE 256
 #define MAX_PROTOCOL_SIZE 6
-#define MAX_PATH_SIZE 1024
 #define MAX_METHOD_SIZE 10
 #define MAX_ERROR_SIZE 1024
 #define TRANSIENT_RESPONSE_KEY "transient"
@@ -62,15 +63,6 @@ typedef struct {
     pthread_mutex_t mutex;
   #endif
 } mutex_t;
-
-int sleep_in_miliseconds(int miliseconds) {
-  #if _WIN32
-    Sleep(miliseconds);
-  #else
-    usleep(miliseconds * 1000);
-  #endif
-}
-
 
 static mutex_t* new_mutex() {
   mutex_t* mutex = malloc(sizeof(mutex_t));
@@ -458,7 +450,7 @@ static int www_requestk(lua_State* L, int status, lua_KContext ctx) {
       request->state = REQUEST_STATE_ERROR;
     }
     if (!ctx)
-      sleep_in_miliseconds(1);
+      usleep(1000);
   } while (!ctx && request->state != REQUEST_STATE_RECV_COMPLETE && request->state != REQUEST_STATE_ERROR);
   if (request->state == REQUEST_STATE_RECV_COMPLETE) {
     request_complete(request);
@@ -498,7 +490,6 @@ static int split_protocol_hostname_path(const char* url, char* protocol, char* h
 }
 
 static int f_www_request(lua_State* L) {
-  long response_code;
   char method[MAX_METHOD_SIZE];
   char protocol[MAX_PROTOCOL_SIZE] = {0};
   char hostname[MAX_HOSTNAME_SIZE] = {0};
@@ -641,7 +632,7 @@ static int request_socket_read(request_t* request, char* buf, int len) {
 static int check_request(request_t* request) {
   switch (request->state) {
     case REQUEST_STATE_INIT: {
-      char err[1024] = {0};
+      char err[MAX_ERROR_SIZE] = {0};
       if (request->is_ssl) {
         int status;
         char port[10];
@@ -777,7 +768,7 @@ static void* www_request_thread_callback(void* data) {
       request = request->next;
     }
     unlock_mutex(www_mutex);
-    sleep_in_miliseconds(1);
+    usleep(1000);
   }
   return NULL;
 }
@@ -841,7 +832,7 @@ static FILE* lua_fopen(lua_State* L, const char* path, const char* mode) {
 
 static int ssl_initialized;
 static int f_www_ssl(lua_State* L) {
-  char err[1024] = {0};
+  char err[MAX_ERROR_SIZE] = {0};
   const char* type = luaL_checkstring(L, 1);
   int status;
   if (ssl_initialized) {
