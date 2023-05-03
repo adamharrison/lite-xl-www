@@ -99,9 +99,6 @@ static int unlock_mutex(mutex_t* mutex) {
   #endif
 }
 
-static mbedtls_x509_crt x509_certificate;
-static mbedtls_entropy_context entropy_context;
-static mbedtls_ctr_drbg_context drbg_context;
 static mbedtls_ssl_config ssl_config;
 static int no_verify_ssl;
 
@@ -179,10 +176,6 @@ static thread_t* www_thread;
 static mutex_t* www_mutex;
 static request_t* request_queue;
 
-#ifndef min
-static int min(int a, int b) { return a < b ? a : b; }
-#endif
-
 static int lua_objlen(lua_State* L, int idx) {
   lua_len(L, idx);
   int n = lua_tointeger(L, -1);
@@ -191,6 +184,7 @@ static int lua_objlen(lua_State* L, int idx) {
 }
 
 #ifndef _WIN32
+static int min(int a, int b) { return a < b ? a : b; }
 static int strnicmp(const char* a, const char* b, int n) {
   for (int i = 0; i < n; ++i) {
     int difference = tolower(b[i]) - tolower(a[i]);
@@ -209,6 +203,7 @@ static int stricmp(const char* a, const char* b) {
   return cmp == 0 && lena != lenb ? (lena < lenb ? -1 : 1) : cmp;
 }
 #endif
+
 
 static request_t* request_enqueue(const char* hostname, unsigned short port, const char* header, int header_length, int content_length, int is_ssl, int max_timeout, int verbose) {
   lock_mutex(www_mutex);
@@ -264,6 +259,7 @@ static void request_complete(request_t* request) {
   }
   unlock_mutex(www_mutex);
 }
+
 
 static int www_requestk(lua_State* L, int status, lua_KContext ctx) {
   int request_response_table_index;
@@ -470,6 +466,7 @@ static int www_requestk(lua_State* L, int status, lua_KContext ctx) {
   return 0;
 }
 
+
 static int split_protocol_hostname_path(const char* url, char* protocol, char* hostname, char* path) {
   char* delim;
   if (!(delim = strpbrk(url, ":")) || (delim - url) > 5)
@@ -488,6 +485,7 @@ static int split_protocol_hostname_path(const char* url, char* protocol, char* h
   }
   return 0;
 }
+
 
 static int f_www_request(lua_State* L) {
   char method[MAX_METHOD_SIZE];
@@ -799,24 +797,6 @@ static LPCWSTR lua_toutf16(lua_State* L, const char* str) {
   luaL_error(L, "can't convert utf8 string");
   return NULL;
 }
-
-static const char* lua_toutf8(lua_State* L, LPCWSTR str) {
-  int len = WideCharToMultiByte(CP_UTF8, 0, str, -1, NULL, 0, NULL, NULL);
-  if (len > 0) {
-    char* output = (char *) malloc(sizeof(char) * len);
-    if (output) {
-      len = WideCharToMultiByte(CP_UTF8, 0, str, -1, output, len, NULL, NULL);
-      if (len) {
-        lua_pushlstring(L, output, len);
-        free(output);
-        return lua_tostring(L, -1);
-      }
-      free(output);
-    }
-  }
-  luaL_error(L, "can't convert utf16 string");
-  return NULL;
-}
 #endif
 
 static FILE* lua_fopen(lua_State* L, const char* path, const char* mode) {
@@ -830,11 +810,14 @@ static FILE* lua_fopen(lua_State* L, const char* path, const char* mode) {
 }
 
 
-static int ssl_initialized;
 static int f_www_ssl(lua_State* L) {
   char err[MAX_ERROR_SIZE] = {0};
   const char* type = luaL_checkstring(L, 1);
   int status;
+  static int ssl_initialized;
+  static mbedtls_x509_crt x509_certificate;
+  static mbedtls_entropy_context entropy_context;
+  static mbedtls_ctr_drbg_context drbg_context;
   if (ssl_initialized) {
     mbedtls_ssl_config_free(&ssl_config);
     mbedtls_ctr_drbg_free(&drbg_context);
@@ -942,17 +925,20 @@ static int f_www_gc(lua_State* L) {
   lua_call(L, 1, 0);
 }
 
- // Core functions, `request` is the primary function, and is stateless (minus the ssl config), and makes raw requests.
+
+// Core functions, `request` is the primary function, and is stateless (minus the ssl config), and makes raw requests.
 static const luaL_Reg www_api[] = {
   { "__gc",     f_www_gc      },    // private, reserved cleanup function for the global ssl state and request queue
-  { "request",  f_www_request },    // response = www.request({ url = string, body = string|function(), method = string|"GET", headers = table|{}, callback = nil|function(response, chunk), progress = function()|nil  })
+  { "request",  f_www_request },    // response = www.request({ url = string, timeout = 5, yield = 0.01, body = string|function(), method = string|"GET", headers = table|{}, response = nil|function(response, chunk)  })
   { "ssl",      f_www_ssl     },    // www.ssl(type, path|nil, debug_level)
   { NULL,       NULL          }
 };
 
+
 #ifndef WWW_VERSION
   #define WWW_VERSION "unknown"
 #endif
+
 
 #ifndef WWW_STANDALONE
 int luaopen_lite_xl_www(lua_State* L, void* XL) {
