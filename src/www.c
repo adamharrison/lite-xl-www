@@ -401,13 +401,7 @@ static int www_requestk(lua_State* L, int status, lua_KContext ctx) {
             } else {
               lua_pop(L, 1);
               lua_getfield(L, request_response_table_index, TRANSIENT_RESPONSE_KEY);
-              lua_getfield(L, -1, "body");
-              if (lua_isnil(L, -1)) {
-                lua_pop(L, 1);
-                lua_newtable(L);
-                lua_pushvalue(L, -1);
-                lua_setfield(L, -3, "body");
-              }
+              luaL_getsubtable(L, -1, "body");
               lua_pushlstring(L, request->chunk, request->chunk_length);
               int n = lua_objlen(L, -2) + 1;
               lua_rawseti(L, -2, n);
@@ -467,11 +461,12 @@ static int www_requestk(lua_State* L, int status, lua_KContext ctx) {
 }
 
 
-static int split_protocol_hostname_path(const char* url, char* protocol, char* hostname, char* path) {
+static int split_protocol_hostname_path(const char* url, char* protocol, char* hostname, char* path, unsigned short* port) {
   char* delim;
   if (!(delim = strpbrk(url, ":")) || (delim - url) > 5)
     return -1;
   strncpy(protocol, url, (delim - url));
+  *port = strcmp(protocol, "https") == 0 ? 443 : 80;
   if (strncmp(&delim[1], "//", 2) != 0)
     return -1;
   delim += 3;
@@ -498,12 +493,13 @@ static int f_www_request(lua_State* L) {
 
   lua_getfield(L, 1, "url");
   const char* url = luaL_checkstring(L, -1);
-  if (split_protocol_hostname_path(url, protocol, hostname, path))
+  unsigned short port;
+  if (split_protocol_hostname_path(url, protocol, hostname, path, &port))
     return luaL_error(L, "unable to parse URL %s", url);
   if (strcmp(protocol, "http") != 0 && strcmp(protocol, "https") != 0)
     return luaL_error(L, "unrecognized protocol");
-
   lua_pop(L, 1);
+
   lua_getfield(L, 1, "verbose");
   int verbose = lua_tointeger(L, -1);
   lua_pop(L, 1);
@@ -575,18 +571,14 @@ static int f_www_request(lua_State* L) {
       return luaL_error(L, "in order to make a request with a body callback function, please specify the 'content-length' as a header.");
     header_offset += snprintf(&header[header_offset], sizeof(header) - header_offset, "content-length: %d\r\n", preset_content_length);
   }
-
   header[header_offset++] = '\r';
   header[header_offset++] = '\n';
-  header[header_offset + 1] = 0;
-  int is_ssl = strcmp(protocol, "https") == 0;
-  unsigned short port = is_ssl ? 443 : 80;
+  header[header_offset] = 0;
+
   if (verbose == 1)
     fprintf(stderr, "%s %s://%s%s\n", method, protocol, hostname, path);
 
-
-  request_t* request = request_enqueue(hostname, port, header, header_offset, preset_content_length, is_ssl, max_timeout, verbose);
-  lua_pushlightuserdata(L, request);
+  lua_pushlightuserdata(L, request_enqueue(hostname, port, header, header_offset, preset_content_length, strcmp(protocol, "https") == 0, max_timeout, verbose));
   lua_setfield(L, 1, "request");
   lua_newtable(L);
   lua_setfield(L, 1, TRANSIENT_RESPONSE_KEY);
