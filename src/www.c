@@ -74,7 +74,7 @@ static mutex_t* new_mutex() {
   return mutex;
 }
 
-static mutex_t* free_mutex(mutex_t* mutex) {
+static void free_mutex(mutex_t* mutex) {
   #if _WIN32
     CloseHandle(mutex->mutex);
   #else
@@ -83,7 +83,7 @@ static mutex_t* free_mutex(mutex_t* mutex) {
   free(mutex);
 }
 
-static int lock_mutex(mutex_t* mutex) {
+static void lock_mutex(mutex_t* mutex) {
   #if _WIN32
     WaitForSingleObject(mutex->mutex, INFINITE);
   #else
@@ -91,7 +91,7 @@ static int lock_mutex(mutex_t* mutex) {
   #endif
 }
 
-static int unlock_mutex(mutex_t* mutex) {
+static void unlock_mutex(mutex_t* mutex) {
   #if _WIN32
     ReleaseMutex(mutex->mutex);
   #else
@@ -272,7 +272,6 @@ static int www_requestk(lua_State* L, int status, lua_KContext ctx) {
   request_t* request = (request_t*)lua_touserdata(L, -1);
   do {
     lock_mutex(www_mutex);
-      time_t current_time = time(NULL);
       switch (request->state) {
         case REQUEST_STATE_SEND_BODY: {
           int spare_room = min(sizeof(request->chunk) - request->chunk_length, request->body_length - request->body_transmitted);
@@ -487,7 +486,6 @@ static int f_www_request(lua_State* L) {
   char protocol[MAX_PROTOCOL_SIZE] = {0};
   char hostname[MAX_HOSTNAME_SIZE] = {0};
   char path[MAX_PATH_SIZE] = "/";
-  char err[MAX_ERROR_SIZE] = {0};
   char header[MAX_REQUEST_HEADER_SIZE];
   const char* version = "HTTP/1.1";
 
@@ -611,11 +609,11 @@ static int mbedtls_snprintf(int mbedtls, char* buffer, int len, int status, cons
 
 
 static int request_socket_write(request_t* request, const char* buf, int len) {
-  return request->is_ssl ? mbedtls_ssl_write(&request->ssl_context, buf, len) : write(request->socket, buf, len);
+  return request->is_ssl ? mbedtls_ssl_write(&request->ssl_context, (const unsigned char*)buf, len) : write(request->socket, buf, len);
 }
 
 static int request_socket_read(request_t* request, char* buf, int len) {
-  return request->is_ssl ? mbedtls_ssl_read(&request->ssl_context, buf, len) : read(request->socket, buf, len);
+  return request->is_ssl ? mbedtls_ssl_read(&request->ssl_context, (unsigned char*)buf, len) : read(request->socket, buf, len);
 }
 
 
@@ -736,6 +734,8 @@ static int check_request(request_t* request) {
       }
     break;
     case REQUEST_STATE_RECV_PROCESS_HEADERS: break;
+    case REQUEST_STATE_RECV_COMPLETE: break;
+    case REQUEST_STATE_ERROR: break;
   }
   if (time(NULL) - request->last_activity > request->timeout_length && request->state != REQUEST_STATE_ERROR && request->state != REQUEST_STATE_RECV_COMPLETE) {
     request->state = REQUEST_STATE_ERROR;
@@ -791,18 +791,13 @@ static LPCWSTR lua_toutf16(lua_State* L, const char* str) {
   luaL_error(L, "can't convert utf8 string");
   return NULL;
 }
-#endif
-
 
 static FILE* lua_fopen(lua_State* L, const char* path, const char* mode) {
-  #ifdef _WIN32
-    FILE* file = _wfopen(lua_toutf16(L, path), lua_toutf16(L, mode));
-    lua_pop(L, 2);
-    return file;
-  #else
-    return fopen(path, mode);
-  #endif
+  FILE* file = _wfopen(lua_toutf16(L, path), lua_toutf16(L, mode));
+  lua_pop(L, 2);
+  return file;
 }
+#endif
 
 
 static int f_www_ssl(lua_State* L) {
@@ -918,6 +913,7 @@ static int f_www_gc(lua_State* L) {
   lua_pushcfunction(L, f_www_ssl);
   lua_pushliteral(L, "none");
   lua_call(L, 1, 0);
+  return 0;
 }
 
 

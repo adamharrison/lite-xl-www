@@ -20,6 +20,14 @@
         "url": "https://github.com/adamharrison/lite-xl-www/releases/download/latest/www.x86_64-windows.dll",
         "arch": "x86_64-windows",
         "checksum": "SKIP"
+    }, {
+        "url": "https://github.com/adamharrison/lite-xl-www/releases/download/latest/www.x86_64-darwin.dll",
+        "arch": "x86_64-darwin",
+        "checksum": "SKIP"
+    }, {
+        "url": "https://github.com/adamharrison/lite-xl-www/releases/download/latest/www.aarch64-darwin.dll",
+        "arch": "aarch64-darwin",
+        "checksum": "SKIP"
     }]
   }]
 }
