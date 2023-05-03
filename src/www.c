@@ -50,7 +50,6 @@
 #define MAX_RESPONSE_CHUNK 4096
 #define YIELD_TIMEOUT 0.01
 #define MAX_TIMEOUT 5
-#define DEFAULT_REDIRECT_FOLLOWS 10
 
 typedef struct {
   #if _WIN32
@@ -907,126 +906,6 @@ static int f_www_gc(lua_State* L) {
   lua_call(L, 1, 0);
 }
 
-// merges the first table into the second on the stack.
-static void www_merge_tables(lua_State* L) {
-  lua_pushnil(L);
-  while (lua_next(L, -3)) {
-    lua_pushvalue(L, -2);
-    lua_pushvalue(L, -2);
-    lua_rawset(L, -5);
-    lua_pop(L, 1);
-  }
-}
-
-
-static int f_www_agent_request(lua_State* L) {
-  luaL_checktype(L, 1, LUA_TTABLE);
-  const char* method = luaL_checkstring(L, 2);
-  int has_body = stricmp(method, "GET") != 0;
-  const char* url = luaL_checkstring(L, 3);
-  if (lua_gettop(L) == (has_body ? 4 : 3))
-    lua_newtable(L);
-  if (has_body) {
-    luaL_checktype(L, 4, LUA_TSTRING);
-    luaL_checktype(L, 5, LUA_TTABLE);
-  } else
-    luaL_checktype(L, 4, LUA_TTABLE);
-  lua_getfield(L, 1, "options");
-  lua_newtable(L);
-  www_merge_tables(L);
-  www_merge_tables(L);
-  int request_parameters_index = lua_gettop(L);
-  lua_pushliteral(L, "url");
-  lua_pushvalue(L, 3);
-  lua_rawset(L, request_parameters_index);
-  lua_pushliteral(L, "method");
-  lua_pushstring(L, method);
-  lua_rawset(L, request_parameters_index);
-  if (has_body) {
-    lua_pushliteral(L, "body");
-    lua_pushvalue(L, 4);
-    lua_rawset(L, request_parameters_index);
-  }
-  lua_pushcfunction(L, f_www_request);
-  lua_pushvalue(L, request_parameters_index);
-  lua_call(L, 1, 1);
-  // Check for redirects.
-  lua_getfield(L, request_parameters_index, "redirects");
-  int redirects = lua_isnil(L, -1) ? DEFAULT_REDIRECT_FOLLOWS : lua_tointeger(L, -1);
-  lua_pop(L, 1);
-  while (redirects > 0) {
-    lua_getfield(L, -1, "code");
-    int code = lua_tointeger(L, -1);
-    lua_pop(L, 1);
-    if (code >= 300 && code < 400) {
-      lua_getfield(L, 1, "redirected");
-      int redirected_count = lua_isnil(L, -1) ? lua_tointeger(L, -1) : 0;
-      lua_pop(L, 1);
-      if (redirected_count > redirects)
-        return luaL_error(L, "redirected %d, which is over the redirect threshold of %d", redirected_count, redirects);
-      lua_getfield(L, -1, "headers");
-      lua_getfield(L, -1, "location");
-      if (lua_isnil(L, -1))
-        return luaL_error(L, "tried to redirect %d times, but server responded with 300, and no location header.", redirected_count);
-
-      const char* redirect_url = lua_tostring(L, -1);
-      if (redirect_url[0] == '/') {
-        char hostname[MAX_HOSTNAME_SIZE] = {0};
-        char protocol[MAX_PROTOCOL_SIZE] = {0};
-        char path[MAX_PATH_SIZE] = "/";
-        if (split_protocol_hostname_path(url, protocol, hostname, path))
-          return luaL_error(L, "can't parse redirect url: %s", redirect_url);
-        lua_pushfstring(L, "%s://%s%s", protocol, hostname, redirect_url);
-        lua_replace(L, -2);
-      }
-      lua_setfield(L, request_parameters_index, "url");
-      lua_pushnil(L);
-      lua_setfield(L, request_parameters_index, "body");
-      lua_pushliteral(L, "GET");
-      lua_setfield(L, request_parameters_index, "method");
-      lua_pop(L, 2);
-      lua_pushcfunction(L, f_www_request);
-      lua_pushvalue(L, request_parameters_index);
-      lua_call(L, 1, 1);
-    } else
-      break;
-  }
-  // End redirect code.
-  lua_getfield(L, -1, "code");
-  int code = lua_tointeger(L, -1);
-  lua_pop(L, 1);
-  if (code >= 300)
-    return lua_error(L);
-  lua_getfield(L, -1, "body");
-  lua_pushvalue(L, -2);
-  return 2;
-}
-
-static int f_www_agent_get(lua_State* L)   {
-  lua_pushliteral(L, "GET");                  lua_insert(L, 2);
-  lua_pushcfunction(L, f_www_agent_request);  lua_insert(L, 1);
-  lua_call(L, lua_gettop(L) - 1, 2);
-  return 2;
-}
-static int f_www_agent_post(lua_State* L)   {
-  lua_pushliteral(L, "POST");                 lua_insert(L, 2);
-  lua_pushcfunction(L, f_www_agent_request);  lua_insert(L, 1);
-  lua_call(L, lua_gettop(L) - 1, 2);
-  return 2;
-}
-static int f_www_agent_put(lua_State* L)   {
-  lua_pushliteral(L, "PUT");                  lua_insert(L, 2);
-  lua_pushcfunction(L, f_www_agent_request);  lua_insert(L, 1);
-  lua_call(L, lua_gettop(L) - 1, 2);
-  return 2;
-}
-static int f_www_agent_delete(lua_State* L) {
-  lua_pushliteral(L, "DELETE");               lua_insert(L, 2);
-  lua_pushcfunction(L, f_www_agent_request);  lua_insert(L, 1);
-  lua_call(L, lua_gettop(L) - 1, 2);
-  return 2;
-}
-
 static int f_www_new(lua_State* L);
 
  // Core functions, `request` is the primary function, and is stateless (minus the ssl config), and makes raw requests.
@@ -1034,32 +913,8 @@ static const luaL_Reg www_api[] = {
   { "__gc",     f_www_gc      },    // private, reserved cleanup function for the global ssl state and request queue
   { "request",  f_www_request },    // response = www.request({ url = string, body = string|function(), method = string|"GET", headers = table|{}, callback = nil|function(response, chunk), progress = function()|nil  })
   { "ssl",      f_www_ssl     },    // www.ssl(type, path|nil, debug_level)
-  { "new",      f_www_new     },    // agent = www.new(options)
   { NULL,       NULL          }
 };
-
-// Utility functions, when instantiated an agent keeps a cookie store, and provides some convenience methods.
-static const luaL_Reg www_agent_api[] = {
-  { "request",      f_www_agent_request },    // body, response = agent:request(method, url, options|nil)
-  { "get",          f_www_agent_get     },    // body, response = agent:get(url, options|nil)
-  { "post",         f_www_agent_post    },    // body, response = agent:post(url, body, options|nil)
-  { "put",          f_www_agent_put     },    // body, response = agent:put(url, body, options|nil)
-  { "delete",       f_www_agent_delete  },    // body, response = agent:delete(url, body, options|nil)
-  { NULL,           NULL                }
-};
-
-static int f_www_new(lua_State* L) {
-  int arguments = lua_gettop(L);
-  luaL_newlib(L, www_agent_api);
-  if (arguments > 0) {
-    luaL_checktype(L, 1, LUA_TTABLE);
-    lua_pushvalue(L, 1);
-  } else {
-    lua_newtable(L);
-  }
-  lua_setfield(L, -2, "options");
-  return 1;
-}
 
 #ifndef WWW_STANDALONE
 int luaopen_lite_xl_www(lua_State* L, void* XL) {
@@ -1081,6 +936,48 @@ int luaopen_www(lua_State* L) {
   luaL_newlib(L, www_api);
   lua_pushvalue(L, -1);
   lua_setmetatable(L, -2);
+  const char* lua_agent_code = "\n\
+    local www = ...\n\
+    function www.new()\n\
+      return {\n\
+        request = function(self, method, url, body, options)\n\
+          local t = { }\n\
+          for k,v in pairs(self.options) do t[k] = v end\n\
+          for k,v in pairs(options or {}) do t[k] = v end\n\
+          t.method = method\n\
+          t.url = url\n\
+          t.body = body\n\
+          local res = www.request(t)\n\
+          while res.code >= 300 and res.code < 400 do\n\
+            t.redirected = (t.redirected or 0) + 1\n\
+            if t.redirected > t.max_redirects then error('redirected ' .. t.redirected .. ', which is over the max redirect threshold') end\n\
+            local location = res.headers.location\n\
+            if not location then error('tried to redirect ' .. t.redirected .. ' times, but server responded with ' .. res.code .. ', and no location header.') end\n\
+            t.method = 'GET'\n\
+            t.body = nil\n\
+            if t.headers then t.headers['content-length'] = nil end\n\
+            if location:find('^/') then\n\
+              local _, _, protocol, hostname, path = t.url:find('^(%w+)://([^/]+)(.*)$')\n\
+              t.url = protocol .. '://' .. hostname .. location\n\
+            else\n\
+              t.url = location\n\
+            end\n\
+            res = www.request(t)\n\
+          end\n\
+          return res.body, res\n\
+        end,\n\
+        get = function(self, url, options) return self:request('GET', url, nil, options) end,\n\
+        post = function(self, url, body, options) return self:request('POST', url, body, options) end,\n\
+        put = function(self, url, body, options) return self:request('PUT', url, body, options) end,\n\
+        delete = function(self, url, body, options) return self:request('DELETE', url, body, options) end,\n\
+        options = { max_redirects = 10 }\n\
+      }\n\
+    end\n\
+  ";
+  if (luaL_loadstring(L, lua_agent_code))
+    return lua_error(L);
+  lua_pushvalue(L, -2);
+  lua_call(L, 1, 0);
   www_mutex = new_mutex();
   return 1;
 }

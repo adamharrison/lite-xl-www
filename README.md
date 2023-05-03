@@ -36,7 +36,7 @@ end)
 
 ## Sample Advanced Usage
 
-For a more nitty-gritty experience, you can use the core method `raw`, which
+For a more nitty-gritty experience, you can use the core method `request`, which
 uses a stateless interface, and will return you the raw request of what you
 request, no redirection, decoding, or anything else.
 
