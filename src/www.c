@@ -287,7 +287,7 @@ static int www_requestk(lua_State* L, int status, lua_KContext ctx) {
       time_t current_time = time(NULL);
       switch (request->state) {
         case REQUEST_STATE_SEND_BODY:
-          int spare_room = sizeof(request->chunk) - request->chunk_length;
+          int spare_room = min(sizeof(request->chunk) - request->chunk_length, request->body_length - request->body_transmitted);
           if (spare_room) {
             lua_getfield(L, 1, "body");
             int offset = 0;
@@ -298,6 +298,7 @@ static int www_requestk(lua_State* L, int status, lua_KContext ctx) {
               case LUA_TFUNCTION: {
                 lua_getfield(L, 1, "transient_chunk");
                 if (lua_isnil(L, -1)) {
+                  lua_pop(L, 1);
                   if (lua_pcall(L, 0, 1, 0)) {
                     lua_pushfstring(L, "error transmitting body: %s", lua_tostring(L, -1)); has_error = 1;
                     goto error;
@@ -322,7 +323,7 @@ static int www_requestk(lua_State* L, int status, lua_KContext ctx) {
                 goto error;
               }
             }
-            int remaining_length = min(spare_room, chunk_length - offset);
+            int remaining_length = min(min(spare_room, chunk_length - offset), request->body_length - request->body_transmitted);
             if (remaining_length > 0) {
               memcpy(&request->chunk[request->chunk_length], &chunk[offset], remaining_length);
               request->chunk_length += remaining_length;
@@ -553,10 +554,13 @@ static int f_www_request(lua_State* L) {
         const char* header_name = luaL_checkstring(L, -2);
         if (stricmp(header_name, "host") == 0)
           has_host_header = 1;
-        else if (stricmp(header_name, "content-length") == 0)
+        else if (stricmp(header_name, "content-length") == 0) {
           has_content_length = 1;
+          preset_content_length = lua_tointeger(L, -1);
+        }
         switch (lua_type(L, -1)) {
           case LUA_TSTRING:
+          case LUA_TNUMBER:
             header_offset += snprintf(&header[header_offset], sizeof(header) - header_offset, "%s: %s\r\n", header_name, lua_tostring(L, -1));
           break;
           case LUA_TTABLE:
@@ -989,10 +993,11 @@ int luaopen_www(lua_State* L) {
           local _, _, protocol, hostname, url = url:find('^(%w+)://([^/]+)(.*)$')\n\
           return protocol, hostname, url\n\
         end,\n\
-        request = function(self, method, url, body, options)\n\
+        request = function(self, method, url, body, headers, options)\n\
           local t = { }\n\
           for k,v in pairs(self.options) do t[k] = v end\n\
           for k,v in pairs(options or {}) do t[k] = v end\n\
+          for k,v in pairs(headers or {}) do t.headers[k] = v end\n\
           t.method = method\n\
           t.url = url\n\
           t.body = body\n\
@@ -1030,10 +1035,10 @@ int luaopen_www(lua_State* L) {
           end\n\
           return res.body, res\n\
         end,\n\
-        get = function(self, url, options) return self:request('GET', url, nil, options) end,\n\
-        post = function(self, url, body, options) return self:request('POST', url, body, options) end,\n\
-        put = function(self, url, body, options) return self:request('PUT', url, body, options) end,\n\
-        delete = function(self, url, body, options) return self:request('DELETE', url, body, options) end,\n\
+        get = function(self, url, headers, options) return self:request('GET', url, nil, headers, options) end,\n\
+        post = function(self, url, body, headers, options) return self:request('POST', url, body, headers, options) end,\n\
+        put = function(self, url, body, headers, options) return self:request('PUT', url, body, headers, options) end,\n\
+        delete = function(self, url, body, headers, options) return self:request('DELETE', url, body, headers, options) end,\n\
         options = options,\n\
         cookies = {}\n\
       }\n\
