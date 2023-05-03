@@ -88,7 +88,7 @@ core.add_thread(function()
   local f = io.open("mylargefile", "wb")
   www.request({
     url = "https://google.com",
-    callback = function(response, chunk)
+    response = function(response, chunk)
       print(response.status)
       f:write(chunk)
     end

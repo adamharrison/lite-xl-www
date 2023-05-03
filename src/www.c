@@ -27,10 +27,6 @@
   #include <mbedtls/debug.h>
 #endif
 
-#ifndef WWW_VERSION
-  #define WWW_VERSION "unknown"
-#endif
-
 #ifdef WWW_STANDALONE
   #include <lua.h>
   #include <lauxlib.h>
@@ -47,9 +43,7 @@
 #define MAX_PATH_SIZE 1024
 #define MAX_METHOD_SIZE 10
 #define MAX_ERROR_SIZE 1024
-#define MAX_RESPONSE_CHUNK 4096
-#define YIELD_TIMEOUT 0.01
-#define MAX_TIMEOUT 5
+#define TRANSIENT_RESPONSE_KEY "transient"
 
 typedef struct {
   #if _WIN32
@@ -174,7 +168,6 @@ typedef struct request_t {
   char hostname[MAX_HOSTNAME_SIZE];
   char chunk[MAX_REQUEST_HEADER_SIZE];
   size_t chunk_length;
-  int is_get;
   int is_ssl;
   int body_length;
   int body_transmitted;
@@ -193,7 +186,6 @@ typedef struct request_t {
 static thread_t* www_thread;
 static mutex_t* www_mutex;
 static request_t* request_queue;
-static char default_user_agent_string[] = "lite-xl-www/" WWW_VERSION;
 
 #ifndef min
 static int min(int a, int b) { return a < b ? a : b; }
@@ -226,7 +218,7 @@ static int stricmp(const char* a, const char* b) {
 }
 #endif
 
-static request_t* request_enqueue(const char* hostname, unsigned short port, const char* header, int header_length, int content_length, int is_ssl, int is_get, int verbose) {
+static request_t* request_enqueue(const char* hostname, unsigned short port, const char* header, int header_length, int content_length, int is_ssl, int max_timeout, int verbose) {
   lock_mutex(www_mutex);
   request_t* request = calloc(sizeof(request_t), 1);
   request->socket = -1;
@@ -234,9 +226,8 @@ static request_t* request_enqueue(const char* hostname, unsigned short port, con
   strncpy(request->chunk, header, min(header_length, MAX_REQUEST_HEADER_SIZE));
   request->chunk_length = header_length;
   request->is_ssl = is_ssl;
-  request->is_get = is_get;
   request->state = REQUEST_STATE_INIT;
-  request->timeout_length = MAX_TIMEOUT;
+  request->timeout_length = max_timeout;
   request->last_activity = time(NULL);
   request->body_length = content_length;
   request->port = port;
@@ -296,25 +287,58 @@ static int www_requestk(lua_State* L, int status, lua_KContext ctx) {
       time_t current_time = time(NULL);
       switch (request->state) {
         case REQUEST_STATE_SEND_BODY:
-          lua_getfield(L, 1, "body");
-          switch (lua_type(L, -1)) {
-            case LUA_TSTRING: {
-              size_t body_length;
-              const char* buffer = lua_tolstring(L, -1, &body_length);
-              int chunk_length = min(sizeof(request->chunk) - request->chunk_length, body_length - request->body_transmitted);
-              if (chunk_length > 0) {
-                memcpy(&request->chunk[request->chunk_length], &buffer[request->body_transmitted], chunk_length);
-                request->chunk_length += chunk_length;
-                request->body_transmitted += chunk_length;
+          int spare_room = sizeof(request->chunk) - request->chunk_length;
+          if (spare_room) {
+            lua_getfield(L, 1, "body");
+            int offset = 0;
+            size_t chunk_length;
+            int type = lua_type(L, -1);
+            const char* chunk = NULL;
+            switch (type) {
+              case LUA_TFUNCTION: {
+                lua_getfield(L, 1, "transient_chunk");
+                if (lua_isnil(L, -1)) {
+                  if (lua_pcall(L, 0, 1, 0)) {
+                    lua_pushfstring(L, "error transmitting body: %s", lua_tostring(L, -1)); has_error = 1;
+                    goto error;
+                  }
+                  lua_pushvalue(L, -1);
+                  lua_setfield(L, 1, "transient_chunk");
+                  lua_pushinteger(L, 0);
+                  lua_setfield(L, 1, "transient_offset");
+                } else {
+                  lua_getfield(L, 1, "transient_offset");
+                  offset = luaL_checkinteger(L, -1);
+                  lua_pop(L, 1);
+                }
+                chunk = luaL_checklstring(L, -1, &chunk_length);
+              } break;
+              case LUA_TSTRING: {
+                offset = request->body_transmitted;
+                chunk = lua_tolstring(L, -1, &chunk_length);
+              } break;
+              default: {
+                lua_pushfstring(L, "error transmitting body; body must be either a string or a callback function, not %s", lua_typename(L, lua_type(L, -1))); has_error = 1;
+                goto error;
               }
-            } break;
-            case LUA_TFUNCTION:
-            default: {
-              lua_pushfstring(L, "error transmitting body; body must be either a string or a callback function", lua_typename(L, lua_type(L, -1))); has_error = 1;
-              goto error;
             }
+            int remaining_length = min(spare_room, chunk_length - offset);
+            if (remaining_length > 0) {
+              memcpy(&request->chunk[request->chunk_length], &chunk[offset], remaining_length);
+              request->chunk_length += remaining_length;
+              request->body_transmitted += remaining_length;
+            }
+            if (type == LUA_TFUNCTION) {
+              if (remaining_length) {
+                lua_pushinteger(L, remaining_length + offset);
+                lua_setfield(L, 1, "transient_offset");
+              } else {
+                lua_pushnil(L);
+                lua_setfield(L, 1, "transient_chunk");
+              }
+            }
+            lua_pop(L, 1);
           }
-          lua_pop(L, 1);
         break;
         case REQUEST_STATE_RECV_PROCESS_HEADERS: {
           const char* code_delim = strpbrk(request->chunk, " ");
@@ -327,7 +351,7 @@ static int www_requestk(lua_State* L, int status, lua_KContext ctx) {
           int code = atoi(code_delim + 1);
           char status_line[128];
           strncpy(status_line, status_delim + 1, min(eol - status_delim - 1, sizeof(status_line)));
-          lua_getfield(L, request_response_table_index, "response");
+          lua_getfield(L, request_response_table_index, TRANSIENT_RESPONSE_KEY);
           lua_pushinteger(L, code);
           lua_setfield(L, -2, "code");
           lua_pushstring(L, status_line);
@@ -355,13 +379,13 @@ static int www_requestk(lua_State* L, int status, lua_KContext ctx) {
             lua_pushlstring(L, header_start, header_name_length);
             lua_pushvalue(L, -1);
             lua_gettable(L, -3);
-            if (lua_isnil(L, -1)) {
+            int is_multiple = !lua_isnil(L, -1);
+            if (!is_multiple)
               lua_pop(L, 1);
-              lua_newtable(L);
-            }
             for (value_offset = value_offset + 1; *value_offset == ' '; ++value_offset);
             lua_pushlstring(L, value_offset, header_end - value_offset);
-            lua_rawseti(L, -2, lua_objlen(L, -2) + 1);
+            if (is_multiple)
+              lua_rawseti(L, -2, lua_objlen(L, -2) + 1);
             lua_rawset(L, -3);
             header_start = header_end + 2;
           }
@@ -375,21 +399,19 @@ static int www_requestk(lua_State* L, int status, lua_KContext ctx) {
         // deliberate fallthrough.
         case REQUEST_STATE_RECV_BODY:
           if (request->chunk_length) {
-            lua_getfield(L, request_response_table_index, "callback");
+            lua_getfield(L, request_response_table_index, "response");
             if (lua_type(L, -1) == LUA_TFUNCTION) {
-              lua_getfield(L, request_response_table_index, "response");
+              lua_getfield(L, request_response_table_index, TRANSIENT_RESPONSE_KEY);
               lua_pushlstring(L, request->chunk, request->chunk_length);
               if (lua_pcall(L, 2, 0, 0)) {
-                size_t len;
-                const char* err = lua_tolstring(L, -1, &request->chunk_length);
-                strncpy(request->chunk, err, sizeof(request->chunk));
-                request->state = REQUEST_STATE_ERROR;
+                lua_pushfstring(L, "error receiving body: %s", lua_tostring(L, -1)); has_error = 1;
+                goto error;
               }
               request->body_transmitted += request->chunk_length;
               request->chunk_length = 0;
             } else {
               lua_pop(L, 1);
-              lua_getfield(L, request_response_table_index, "response");
+              lua_getfield(L, request_response_table_index, TRANSIENT_RESPONSE_KEY);
               lua_getfield(L, -1, "body");
               if (lua_isnil(L, -1)) {
                 lua_pop(L, 1);
@@ -406,7 +428,7 @@ static int www_requestk(lua_State* L, int status, lua_KContext ctx) {
             }
           }
           if (request->body_transmitted >= request->body_length) {
-            lua_getfield(L, request_response_table_index, "response");
+            lua_getfield(L, request_response_table_index, TRANSIENT_RESPONSE_KEY);
             lua_getfield(L, -1, "body");
             int body_table_index = lua_gettop(L);
             if (lua_type(L, -1) == LUA_TTABLE) {
@@ -439,7 +461,7 @@ static int www_requestk(lua_State* L, int status, lua_KContext ctx) {
   } while (!ctx && request->state != REQUEST_STATE_RECV_COMPLETE && request->state != REQUEST_STATE_ERROR);
   if (request->state == REQUEST_STATE_RECV_COMPLETE) {
     request_complete(request);
-    lua_getfield(L, request_response_table_index, "response");
+    lua_getfield(L, request_response_table_index, TRANSIENT_RESPONSE_KEY);
     if (ctx)
       luaL_unref(L, LUA_REGISTRYINDEX, (int)ctx);
     return 1;
@@ -449,7 +471,7 @@ static int www_requestk(lua_State* L, int status, lua_KContext ctx) {
     request_complete(request);
     return lua_error(L);
   } else {
-    lua_pushnumber(L, YIELD_TIMEOUT);
+    lua_getfield(L, request_response_table_index, "yield");
     lua_yieldk(L, 1, ctx, www_requestk);
   }
   return 0;
@@ -496,15 +518,15 @@ static int f_www_request(lua_State* L) {
   int verbose = lua_tointeger(L, -1);
   lua_pop(L, 1);
 
+  int max_timeout = 5;
+  lua_getfield(L, 1, "timeout");
+  if (!lua_isnil(L, -1))
+      max_timeout = luaL_checkinteger(L, -1);
+  lua_pop(L, 1);
+
   lua_getfield(L, 1, "body");
   int has_body = !lua_isnil(L, -1);
-  int preset_content_length = -1;
-  if (lua_isstring(L, -1)) {
-    size_t len;
-    lua_tolstring(L, -1, &len);
-    preset_content_length = len;
-  }
-  lua_pop(L,1);
+
   lua_getfield(L, 1, "method");
   if (!lua_isnil(L, -1))
     strncpy(method, luaL_checkstring(L, -1), sizeof(method));
@@ -512,44 +534,54 @@ static int f_www_request(lua_State* L) {
     strcpy(method, has_body ? "POST" : "GET");
   lua_pop(L, 1);
 
-  int is_get = strcmp(method, "GET") == 0;
+  int preset_content_length = strcmp(method, "GET") == 0 ? 0 : -1;
+  if (lua_isstring(L, -1)) {
+    size_t len;
+    lua_tolstring(L, -1, &len);
+    preset_content_length = len;
+  }
+  lua_pop(L,1);
 
   int header_offset = snprintf(header, sizeof(header), "%s %s %s\r\n", method, path, version);
   int has_host_header = 0;
-  int has_user_agent_header = 0;
   int has_content_length = 0;
-  int has_content_type = 0;
   lua_getfield(L, 1, "headers");
   if (!lua_isnil(L, -1)) {
     lua_pushnil(L);
     while (lua_next(L, -2)) {
       if (header_offset < sizeof(header)) {
         const char* header_name = luaL_checkstring(L, -2);
-        if (stricmp(header_name, "user-agent") == 0)
-          has_user_agent_header = 1;
-        else if (stricmp(header_name, "host") == 0)
+        if (stricmp(header_name, "host") == 0)
           has_host_header = 1;
         else if (stricmp(header_name, "content-length") == 0)
           has_content_length = 1;
-        else if (stricmp(header_name, "content-type") == 0)
-          has_content_length = 1;
-        header_offset += snprintf(&header[header_offset], sizeof(header) - header_offset, "%s: %s\r\n", header_name, lua_tostring(L, -1));
+        switch (lua_type(L, -1)) {
+          case LUA_TSTRING:
+            header_offset += snprintf(&header[header_offset], sizeof(header) - header_offset, "%s: %s\r\n", header_name, lua_tostring(L, -1));
+          break;
+          case LUA_TTABLE:
+            int n = lua_objlen(L, -1);
+            for (int i = 1; i < n; ++i) {
+              lua_rawgeti(L, -1, n);
+              header_offset += snprintf(&header[header_offset], sizeof(header) - header_offset, "%s: %s\r\n", header_name, lua_tostring(L, -1));
+              lua_pop(L, 1);
+            }
+          break;
+          default:
+            return luaL_error(L, "invalid header value for header %s", header_name);
+        }
       }
       lua_pop(L, 1);
     }
   }
   lua_pop(L, 1);
   if (!has_host_header)
-    header_offset += snprintf(&header[header_offset], sizeof(header) - header_offset, "Host: %s\r\n", hostname);
-  if (!has_user_agent_header)
-    header_offset += snprintf(&header[header_offset], sizeof(header) - header_offset, "User-Agent: %s\r\n", default_user_agent_string);
+    header_offset += snprintf(&header[header_offset], sizeof(header) - header_offset, "host: %s\r\n", hostname);
   if (!has_content_length && has_body) {
     if (preset_content_length == -1)
       return luaL_error(L, "in order to make a request with a body callback function, please specify the 'content-length' as a header.");
-    header_offset += snprintf(&header[header_offset], sizeof(header) - header_offset, "Content-Length: %d\r\n", preset_content_length);
+    header_offset += snprintf(&header[header_offset], sizeof(header) - header_offset, "content-length: %d\r\n", preset_content_length);
   }
-  if (has_body && !has_content_type)
-    header_offset += snprintf(&header[header_offset], sizeof(header) - header_offset, "Content-Type: application/x-www-form-urlencoded\r\n");
 
   header[header_offset++] = '\r';
   header[header_offset++] = '\n';
@@ -558,11 +590,13 @@ static int f_www_request(lua_State* L) {
   unsigned short port = is_ssl ? 443 : 80;
   if (verbose == 1)
     fprintf(stderr, "%s %s://%s%s\n", method, protocol, hostname, path);
-  request_t* request = request_enqueue(hostname, port, header, header_offset, preset_content_length, is_ssl, is_get, verbose);
+
+
+  request_t* request = request_enqueue(hostname, port, header, header_offset, preset_content_length, is_ssl, max_timeout, verbose);
   lua_pushlightuserdata(L, request);
   lua_setfield(L, 1, "request");
   lua_newtable(L);
-  lua_setfield(L, 1, "response");
+  lua_setfield(L, 1, TRANSIENT_RESPONSE_KEY);
   if (is_main_thread(L)) {
     www_requestk(L, 0, 0);
   } else {
@@ -672,7 +706,7 @@ static int check_request(request_t* request) {
           request->last_activity = time(NULL);
           request->chunk_length = 0;
           if (request->state == REQUEST_STATE_SEND_HEADERS) {
-            if (!request->is_get)
+            if (request->body_length != 0)
               request->state = REQUEST_STATE_SEND_BODY;
             else
               request->state = REQUEST_STATE_RECV_HEADERS;
@@ -913,8 +947,6 @@ static int f_www_gc(lua_State* L) {
   lua_call(L, 1, 0);
 }
 
-static int f_www_new(lua_State* L);
-
  // Core functions, `request` is the primary function, and is stateless (minus the ssl config), and makes raw requests.
 static const luaL_Reg www_api[] = {
   { "__gc",     f_www_gc      },    // private, reserved cleanup function for the global ssl state and request queue
@@ -923,33 +955,36 @@ static const luaL_Reg www_api[] = {
   { NULL,       NULL          }
 };
 
+#ifndef WWW_VERSION
+  #define WWW_VERSION "unknown"
+#endif
+
 #ifndef WWW_STANDALONE
 int luaopen_lite_xl_www(lua_State* L, void* XL) {
   lite_xl_plugin_init(XL);
 #else
 int luaopen_www(lua_State* L) {
+  #ifndef _WIN32
+    lua_pushliteral(L, "/");
+  #else
+    lua_pushliteral(L, "\\");
+  #endif
+  lua_setglobal(L, "PATHSEP");
 #endif
-  lua_pushcfunction(L, f_www_ssl);
-  lua_pushliteral(L, "system");
-#ifndef WWW_STANDALONE
-  lua_getglobal(L, "USERDIR");
-#else
-  lua_pushliteral(L, "/tmp");
-#endif
-  lua_pushliteral(L, "/ssl.certs");
-  lua_concat(L, 2);
-  lua_pushinteger(L, 0);
-  lua_call(L, 3, 0);
   luaL_newlib(L, www_api);
+  lua_pushliteral(L, WWW_VERSION);
+  lua_setfield(L, -2, "version");
   lua_pushvalue(L, -1);
   lua_setmetatable(L, -2);
   const char* lua_agent_code = "\n\
     local www = ...\n\
+    www.ssl('system', (USERDIR or '/tmp') .. PATHSEP .. 'ssl.certs', 0)\n\
     function www.new(default_options)\n\
-      local options = { max_redirects = 10 }\n\
+      local options = { max_redirects = 10, yield = 0.01, max_timeout = 5, headers = { ['user-agent'] = 'lite-xl-www/' .. www.version } }\n\
       for k,v in pairs(default_options or {}) do options[k] = v end\n\
       return {\n\
         encode = function(value) return value end,\n\
+        decode = function(value) return value end,\n\
         components = function(url)\n\
           local _, _, protocol, hostname, url = url:find('^(%w+)://([^/]+)(.*)$')\n\
           return protocol, hostname, url\n\
@@ -962,36 +997,35 @@ int luaopen_www(lua_State* L) {
           t.url = url\n\
           t.body = body\n\
           local res\n\
-          while not res or (res.code >= 300 and res.code < 400) do\n\
+          while true do\n\
             local protocol, hostname, path = self.components(t.url)\n\
             if self.cookies[hostname] then\n\
-              t.headers = t.headers or {}\n\
               local values = {}\n\
               for k,v in pairs(self.cookies[hostname]) do table.insert(values, k .. '=' .. self.encode(v.value)) end\n\
-              if not t.headers['cookie'] then t.headers['cookie'] = table.concat(values, '&') end\n\
+              if not t.headers['cookie'] then t.headers['cookie'] = table.concat(values, '; ') end\n\
             end\n\
             res = www.request(t)\n\
             if res.headers['set-cookie'] then\n\
-              for i,v in ipairs(res.headers['set-cookie']) do\n\
+              for i,v in ipairs(type(res.headers['set-cookie']) == 'table' and res.headers['set-cookie'] or { res.headers['set-cookie'] }) do\n\
                 local _, e, name, value = v:find('^([^=]+)=([^;]+)')\n\
                 if not self.cookies[hostname] then self.cookies[hostname] = {} end\n\
-                self.cookies[hostname][name] = { value = value }\n\
+                self.cookies[hostname][name] = { value = self.decode(value) }\n\
               end\n\
             end\n\
-            if res.code >= 300 and res.code < 400 then\n\
-              t.redirected = (t.redirected or 0) + 1\n\
-              if t.redirected > t.max_redirects then error('redirected ' .. t.redirected .. ', which is over the max redirect threshold') end\n\
-              local location = res.headers.location\n\
-              if not location then error('tried to redirect ' .. t.redirected .. ' times, but server responded with ' .. res.code .. ', and no location header.') end\n\
-              t.method = 'GET'\n\
-              t.body = nil\n\
-              if t.headers then t.headers['content-length'] = nil end\n\
-              if location[1]:find('^/') then\n\
-                protocol, hostname, path = self.components(t.url)\n\
-                t.url = protocol .. '://' .. hostname .. location[1]\n\
-              else\n\
-                t.url = location\n\
-              end\n\
+            if res.code >= 400 then error(res) end\n\
+            if res.code < 300 then break end\n\
+            t.redirected = (t.redirected or 0) + 1\n\
+            if t.redirected > t.max_redirects then error('redirected ' .. t.redirected .. ', which is over the max redirect threshold') end\n\
+            local location = res.headers.location\n\
+            if not location then error('tried to redirect ' .. t.redirected .. ' times, but server responded with ' .. res.code .. ', and no location header.') end\n\
+            t.method = 'GET'\n\
+            t.body = nil\n\
+            if t.headers then t.headers['content-length'] = nil end\n\
+            if location:find('^/') then\n\
+              protocol, hostname, path = self.components(t.url)\n\
+              t.url = protocol .. '://' .. hostname .. location\n\
+            else\n\
+              t.url = location\n\
             end\n\
           end\n\
           return res.body, res\n\
