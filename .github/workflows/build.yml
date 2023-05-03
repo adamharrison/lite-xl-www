@@ -53,7 +53,6 @@ jobs:
         run: |
           export FULL_VERSION=`git describe --tags` && mkdir bin
           ./build.sh clean && BIN="bin/www.x86_64-darwin.so" ./build.sh -DWWW_VERSION='"'$FULL_VERSION'"'
-          ./build.sh clean && CFLAGS="-m32" BIN="bin/www.x86-darwin.so" ./build.sh -DWWW_VERSION='"'$FULL_VERSION'"'
           ./build.sh clean && BIN="bin/www.aarch64-darwin.so" CC=clang CFLAGS="-arch arm64" ./build.sh -DWWW_VERSION='"'$FULL_VERSION'"'
           gh release upload continuous bin/*.so
           if [[ `git tag --points-at HEAD | head -c 1` == "v" ]]; then
