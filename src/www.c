@@ -353,8 +353,15 @@ static int www_requestk(lua_State* L, int status, lua_KContext ctx) {
             if (strncmp(header_start, "content-length", 14) == 0)
               request->body_length = atoi(value_offset + 1);
             lua_pushlstring(L, header_start, header_name_length);
+            lua_pushvalue(L, -1);
+            lua_gettable(L, -3);
+            if (lua_isnil(L, -1)) {
+              lua_pop(L, 1);
+              lua_newtable(L);
+            }
             for (value_offset = value_offset + 1; *value_offset == ' '; ++value_offset);
             lua_pushlstring(L, value_offset, header_end - value_offset);
+            lua_rawseti(L, -2, lua_objlen(L, -2) + 1);
             lua_rawset(L, -3);
             header_start = header_end + 2;
           }
@@ -938,8 +945,15 @@ int luaopen_www(lua_State* L) {
   lua_setmetatable(L, -2);
   const char* lua_agent_code = "\n\
     local www = ...\n\
-    function www.new()\n\
+    function www.new(default_options)\n\
+      local options = { max_redirects = 10 }\n\
+      for k,v in pairs(default_options or {}) do options[k] = v end\n\
       return {\n\
+        encode = function(value) return value end,\n\
+        components = function(url)\n\
+          local _, _, protocol, hostname, url = url:find('^(%w+)://([^/]+)(.*)$')\n\
+          return protocol, hostname, url\n\
+        end,\n\
         request = function(self, method, url, body, options)\n\
           local t = { }\n\
           for k,v in pairs(self.options) do t[k] = v end\n\
@@ -947,22 +961,38 @@ int luaopen_www(lua_State* L) {
           t.method = method\n\
           t.url = url\n\
           t.body = body\n\
-          local res = www.request(t)\n\
-          while res.code >= 300 and res.code < 400 do\n\
-            t.redirected = (t.redirected or 0) + 1\n\
-            if t.redirected > t.max_redirects then error('redirected ' .. t.redirected .. ', which is over the max redirect threshold') end\n\
-            local location = res.headers.location\n\
-            if not location then error('tried to redirect ' .. t.redirected .. ' times, but server responded with ' .. res.code .. ', and no location header.') end\n\
-            t.method = 'GET'\n\
-            t.body = nil\n\
-            if t.headers then t.headers['content-length'] = nil end\n\
-            if location:find('^/') then\n\
-              local _, _, protocol, hostname, path = t.url:find('^(%w+)://([^/]+)(.*)$')\n\
-              t.url = protocol .. '://' .. hostname .. location\n\
-            else\n\
-              t.url = location\n\
+          local res\n\
+          while not res or (res.code >= 300 and res.code < 400) do\n\
+            local protocol, hostname, path = self.components(t.url)\n\
+            if self.cookies[hostname] then\n\
+              t.headers = t.headers or {}\n\
+              local values = {}\n\
+              for k,v in pairs(self.cookies[hostname]) do table.insert(values, k .. '=' .. self.encode(v.value)) end\n\
+              if not t.headers['cookie'] then t.headers['cookie'] = table.concat(values, '&') end\n\
             end\n\
             res = www.request(t)\n\
+            if res.headers['set-cookie'] then\n\
+              for i,v in ipairs(res.headers['set-cookie']) do\n\
+                local _, e, name, value = v:find('^([^=]+)=([^;]+)')\n\
+                if not self.cookies[hostname] then self.cookies[hostname] = {} end\n\
+                self.cookies[hostname][name] = { value = value }\n\
+              end\n\
+            end\n\
+            if res.code >= 300 and res.code < 400 then\n\
+              t.redirected = (t.redirected or 0) + 1\n\
+              if t.redirected > t.max_redirects then error('redirected ' .. t.redirected .. ', which is over the max redirect threshold') end\n\
+              local location = res.headers.location\n\
+              if not location then error('tried to redirect ' .. t.redirected .. ' times, but server responded with ' .. res.code .. ', and no location header.') end\n\
+              t.method = 'GET'\n\
+              t.body = nil\n\
+              if t.headers then t.headers['content-length'] = nil end\n\
+              if location[1]:find('^/') then\n\
+                protocol, hostname, path = self.components(t.url)\n\
+                t.url = protocol .. '://' .. hostname .. location[1]\n\
+              else\n\
+                t.url = location\n\
+              end\n\
+            end\n\
           end\n\
           return res.body, res\n\
         end,\n\
@@ -970,7 +1000,8 @@ int luaopen_www(lua_State* L) {
         post = function(self, url, body, options) return self:request('POST', url, body, options) end,\n\
         put = function(self, url, body, options) return self:request('PUT', url, body, options) end,\n\
         delete = function(self, url, body, options) return self:request('DELETE', url, body, options) end,\n\
-        options = { max_redirects = 10 }\n\
+        options = options,\n\
+        cookies = {}\n\
       }\n\
     end\n\
   ";
@@ -981,5 +1012,3 @@ int luaopen_www(lua_State* L) {
   www_mutex = new_mutex();
   return 1;
 }
-
-
