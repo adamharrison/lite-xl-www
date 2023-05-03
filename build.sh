@@ -8,8 +8,10 @@
 : ${JOBS=4}
 
 SRCS="src/*.c"
-CFLAGS="$CFLAGS -Ilib/prefix/include -fPIC -Ilib/lite-xl/resources/include -static-libgcc"
+CFLAGS="$CFLAGS -Ilib/prefix/include -fPIC -Ilib/lite-xl/resources/include"
 LDFLAGS="$LDFLAGS -lm -Llib/prefix/lib"
+
+[[ $OSTYPE != *'darwin'* ]] && CFLAGS="$CFLAGS -static-libgcc"
 
 [[ "$@" == "clean" ]] && rm -rf lib/zlib/build lib/mbedtls-2.27.0/build lib/prefix *.so && exit 0
 $CMAKE --version >/dev/null 2>/dev/null || { echo "Please ensure that you have cmake installed." && exit -1; }
