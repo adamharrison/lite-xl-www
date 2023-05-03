@@ -274,7 +274,7 @@ static int www_requestk(lua_State* L, int status, lua_KContext ctx) {
     lock_mutex(www_mutex);
       time_t current_time = time(NULL);
       switch (request->state) {
-        case REQUEST_STATE_SEND_BODY:
+        case REQUEST_STATE_SEND_BODY: {
           int spare_room = min(sizeof(request->chunk) - request->chunk_length, request->body_length - request->body_transmitted);
           if (spare_room) {
             lua_getfield(L, 1, "body");
@@ -328,7 +328,7 @@ static int www_requestk(lua_State* L, int status, lua_KContext ctx) {
             }
             lua_pop(L, 1);
           }
-        break;
+        } break;
         case REQUEST_STATE_RECV_PROCESS_HEADERS: {
           const char* code_delim = strpbrk(request->chunk, " ");
           const char* status_delim = code_delim ? strpbrk(code_delim + 1, " ") : NULL;
@@ -548,14 +548,14 @@ static int f_www_request(lua_State* L) {
           case LUA_TNUMBER:
             header_offset += snprintf(&header[header_offset], sizeof(header) - header_offset, "%s: %s\r\n", header_name, lua_tostring(L, -1));
           break;
-          case LUA_TTABLE:
+          case LUA_TTABLE: {
             int n = lua_objlen(L, -1);
             for (int i = 1; i < n; ++i) {
               lua_rawgeti(L, -1, n);
               header_offset += snprintf(&header[header_offset], sizeof(header) - header_offset, "%s: %s\r\n", header_name, lua_tostring(L, -1));
               lua_pop(L, 1);
             }
-          break;
+          } break;
           default:
             return luaL_error(L, "invalid header value for header %s", header_name);
         }
@@ -744,6 +744,7 @@ static int check_request(request_t* request) {
   return -1;
 }
 
+
 static void* www_request_thread_callback(void* data) {
   while (1) {
     lock_mutex(www_mutex);
@@ -762,6 +763,7 @@ static void* www_request_thread_callback(void* data) {
   }
   return NULL;
 }
+
 
 static void www_tls_debug(void *ctx, int level, const char *file, int line, const char *str) {
   fprintf(stderr, "%s:%04d: |%d| %s", file, line, level, str);
@@ -790,6 +792,7 @@ static LPCWSTR lua_toutf16(lua_State* L, const char* str) {
   return NULL;
 }
 #endif
+
 
 static FILE* lua_fopen(lua_State* L, const char* path, const char* mode) {
   #ifdef _WIN32
