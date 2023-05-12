@@ -174,6 +174,7 @@ typedef struct request_t {
   int body_transmitted;
   int verbose;
   int timeout_length;
+  int close_on_complete;
   request_type_e state;
   struct request_t* prev;
   struct request_t* next;
@@ -239,6 +240,7 @@ static request_t* request_enqueue(connection_t* connection, const char* header, 
   request->chunk_length = header_length;
   request->state = REQUEST_STATE_INIT_CONNECTION;
   request->timeout_length = max_timeout;
+  request->close_on_complete = 0;
   request->body_length = content_length;
   request->verbose = verbose;
   if (request_queue) {
@@ -260,8 +262,10 @@ static void request_complete(request_t* request) {
     request_queue = request->next;
   if (request->next)
     request->next->prev = request->prev;
-  if (request->connection->active == request)
+  if (request->connection->active == request) {
+    close_connection(request->connection);
     request->connection->active = NULL;
+  }
   free(request);
   if (!request_queue) {
     if (www_thread) {
@@ -385,6 +389,8 @@ static int www_requestk(lua_State* L, int status, lua_KContext ctx) {
             if (!is_multiple)
               lua_pop(L, 1);
             for (value_offset = value_offset + 1; *value_offset == ' '; ++value_offset);
+            if (strncmp(header_start, "connection", 10) == 0 && header_end - value_offset == 5 && strncmp(value_offset + 1, "close", 5) == 0)
+              request->close_on_complete = 1;
             lua_pushlstring(L, value_offset, header_end - value_offset);
             if (is_multiple)
               lua_rawseti(L, -2, lua_objlen(L, -2) + 1);
@@ -670,7 +676,7 @@ static int check_request(request_t* request) {
         request->connection->active = request;
       if (request->connection->active != request)
         break;
-      if (request->connection->socket != -1 && time(NULL) - request->connection->last_activity > MAX_IDLE_TIME) {
+      if (request->connection->is_open && time(NULL) - request->connection->last_activity < MAX_IDLE_TIME) {
         request->state = REQUEST_STATE_SEND_HEADERS;
         break;
       }
