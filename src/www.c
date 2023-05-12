@@ -10,6 +10,7 @@
   #include <arpa/inet.h>
   #include <unistd.h>
   #include <fcntl.h>
+  #include <errno.h>
 #endif
 #include <stdlib.h>
 #include <ctype.h>
@@ -44,6 +45,7 @@
 #define MAX_PROTOCOL_SIZE 6
 #define MAX_METHOD_SIZE 10
 #define MAX_ERROR_SIZE 1024
+#define MAX_IDLE_TIME 60
 #define TRANSIENT_RESPONSE_KEY "transient"
 
 typedef struct {
@@ -141,8 +143,20 @@ static void* join_thread(thread_t* thread) {
   return retval;
 }
 
+typedef struct connection_t {
+  int socket;
+  int is_ssl;
+  unsigned short port;
+  int is_open;
+  char hostname[MAX_HOSTNAME_SIZE];
+  mbedtls_net_context net_context;
+  mbedtls_ssl_context ssl_context;
+  time_t last_activity;
+  struct request_t* active;
+} connection_t;
+
 typedef enum {
-  REQUEST_STATE_INIT,
+  REQUEST_STATE_INIT_CONNECTION,
   REQUEST_STATE_SEND_HEADERS,
   REQUEST_STATE_SEND_BODY,
   REQUEST_STATE_RECV_HEADERS,
@@ -153,20 +167,14 @@ typedef enum {
 } request_type_e;
 
 typedef struct request_t {
-  int socket;
-  char hostname[MAX_HOSTNAME_SIZE];
+  connection_t* connection;
   char chunk[MAX_REQUEST_HEADER_SIZE];
   size_t chunk_length;
-  int is_ssl;
   int body_length;
   int body_transmitted;
   int verbose;
-  time_t last_activity;
   int timeout_length;
-  unsigned short port;
   request_type_e state;
-  mbedtls_net_context net_context;
-  mbedtls_ssl_context ssl_context;
   struct request_t* prev;
   struct request_t* next;
 } request_t;
@@ -204,25 +212,35 @@ static int stricmp(const char* a, const char* b) {
 }
 #endif
 
+static void close_connection(connection_t* connection) {
+  if (connection->is_open) {
+    if (connection->is_ssl) {
+      mbedtls_ssl_free(&connection->ssl_context);
+      mbedtls_net_free(&connection->net_context);
+    }
+    if (connection->socket != -1)
+      close(connection->socket);
+    connection->is_open = 0;
+  }
+}
 
-static request_t* request_enqueue(const char* hostname, unsigned short port, const char* header, int header_length, int content_length, int is_ssl, int max_timeout, int verbose) {
+static int www_close(lua_State* L) {
+  lock_mutex(www_mutex);
+  close_connection((connection_t*)lua_touserdata(L, -1));
+  unlock_mutex(www_mutex);
+  return 0;
+}
+
+static request_t* request_enqueue(connection_t* connection, const char* header, int header_length, int content_length, int max_timeout, int verbose) {
   lock_mutex(www_mutex);
   request_t* request = calloc(sizeof(request_t), 1);
-  request->socket = -1;
-  strncpy(request->hostname, hostname, MAX_HOSTNAME_SIZE);
+  request->connection = connection;
   strncpy(request->chunk, header, min(header_length, MAX_REQUEST_HEADER_SIZE));
   request->chunk_length = header_length;
-  request->is_ssl = is_ssl;
-  request->state = REQUEST_STATE_INIT;
+  request->state = REQUEST_STATE_INIT_CONNECTION;
   request->timeout_length = max_timeout;
-  request->last_activity = time(NULL);
   request->body_length = content_length;
-  request->port = port;
   request->verbose = verbose;
-  if (is_ssl) {
-    mbedtls_ssl_init(&request->ssl_context);
-    mbedtls_net_init(&request->net_context);
-  }
   if (request_queue) {
     request_queue->prev = request;
     request->next = request_queue;
@@ -242,12 +260,8 @@ static void request_complete(request_t* request) {
     request_queue = request->next;
   if (request->next)
     request->next->prev = request->prev;
-  if (request->is_ssl) {
-    mbedtls_ssl_free(&request->ssl_context);
-    mbedtls_net_free(&request->net_context);
-  }
-  if (request->socket != -1)
-    close(request->socket);
+  if (request->connection->active == request)
+    request->connection->active = NULL;
   free(request);
   if (!request_queue) {
     if (www_thread) {
@@ -444,9 +458,10 @@ static int www_requestk(lua_State* L, int status, lua_KContext ctx) {
   if (request->state == REQUEST_STATE_RECV_COMPLETE) {
     request_complete(request);
     lua_getfield(L, request_response_table_index, TRANSIENT_RESPONSE_KEY);
+    lua_getfield(L, request_response_table_index, "connection");
     if (ctx)
       luaL_unref(L, LUA_REGISTRYINDEX, (int)ctx);
-    return 1;
+    return 2;
   } else if (request->state == REQUEST_STATE_ERROR) {
     lua_pop(L, 1);
     lua_pushfstring(L, "error in request: %s", request->chunk);
@@ -454,6 +469,8 @@ static int www_requestk(lua_State* L, int status, lua_KContext ctx) {
     return lua_error(L);
   } else {
     lua_getfield(L, request_response_table_index, "yield");
+    lua_replace(L, 1);
+    lua_settop(L, 1);
     lua_yieldk(L, 1, ctx, www_requestk);
   }
   return 0;
@@ -479,6 +496,7 @@ static int split_protocol_hostname_path(const char* url, char* protocol, char* h
   }
   return 0;
 }
+
 
 
 static int f_www_request(lua_State* L) {
@@ -576,7 +594,34 @@ static int f_www_request(lua_State* L) {
   if (verbose == 1)
     fprintf(stderr, "%s %s://%s%s\n", method, protocol, hostname, path);
 
-  lua_pushlightuserdata(L, request_enqueue(hostname, port, header, header_offset, preset_content_length, strcmp(protocol, "https") == 0, max_timeout, verbose));
+  lua_getfield(L, 1, "connection");
+  connection_t* connection;
+  if (lua_isnil(L, -1)) {
+    lua_pop(L, 1);
+    connection = (connection_t*)lua_newuserdata(L, sizeof(connection_t));
+    lua_newtable(L);
+    lua_pushcfunction(L, www_close);
+    lua_setfield(L, -2, "__gc");
+    lua_setmetatable(L, -2);
+    strncpy(connection->hostname, hostname, sizeof(hostname));
+    connection->port = port;
+    connection->socket = -1;
+    connection->is_ssl = strcmp(protocol, "https") == 0;
+    connection->last_activity = time(NULL);
+    connection->active = NULL;
+  } else {
+    luaL_checktype(L, -1, LUA_TUSERDATA);
+    connection = (connection_t*)lua_touserdata(L, -1);
+    if (strcmp(connection->hostname, hostname) != 0)
+      return luaL_error(L, "supplied connection is connected to %s, trying to connect to %s.", connection->hostname, hostname);
+    if (connection->is_ssl == (strcmp(protocol, "http") == 0))
+      return luaL_error(L, "supplied connection is connected over https; trying to make an http request.");
+    if (connection->port != port)
+      return luaL_error(L, "supplied connection is connected over port %d; trying to connect on port %d.", connection->port, port);
+  }
+  lua_setfield(L, 1, "connection");
+
+  lua_pushlightuserdata(L, request_enqueue(connection, header, header_offset, preset_content_length, max_timeout, verbose));
   lua_setfield(L, 1, "request");
   lua_newtable(L);
   lua_setfield(L, 1, TRANSIENT_RESPONSE_KEY);
@@ -587,7 +632,7 @@ static int f_www_request(lua_State* L) {
     lua_pushnumber(L, 0);
     lua_yieldk(L, 1, (lua_KContext)r, www_requestk);
   }
-  return 1;
+  return 2;
 }
 
 static int mbedtls_snprintf(int mbedtls, char* buffer, int len, int status, const char* str, ...) {
@@ -609,42 +654,53 @@ static int mbedtls_snprintf(int mbedtls, char* buffer, int len, int status, cons
 
 
 static int request_socket_write(request_t* request, const char* buf, int len) {
-  return request->is_ssl ? mbedtls_ssl_write(&request->ssl_context, (const unsigned char*)buf, len) : write(request->socket, buf, len);
+  return request->connection->is_ssl ? mbedtls_ssl_write(&request->connection->ssl_context, (const unsigned char*)buf, len) : write(request->connection->socket, buf, len);
 }
 
 static int request_socket_read(request_t* request, char* buf, int len) {
-  return request->is_ssl ? mbedtls_ssl_read(&request->ssl_context, (unsigned char*)buf, len) : read(request->socket, buf, len);
+  return request->connection->is_ssl ? mbedtls_ssl_read(&request->connection->ssl_context, (unsigned char*)buf, len) : read(request->connection->socket, buf, len);
 }
 
 
 static int check_request(request_t* request) {
   switch (request->state) {
-    case REQUEST_STATE_INIT: {
+    case REQUEST_STATE_INIT_CONNECTION: {
       char err[MAX_ERROR_SIZE] = {0};
-      if (request->is_ssl) {
+      if (!request->connection->active)
+        request->connection->active = request;
+      if (request->connection->active != request)
+        break;
+      if (request->connection->socket != -1 && time(NULL) - request->connection->last_activity > MAX_IDLE_TIME) {
+        request->state = REQUEST_STATE_SEND_HEADERS;
+        break;
+      }
+      close_connection(request->connection);
+      if (request->connection->is_ssl) {
         int status;
         char port[10];
-        snprintf(port, sizeof(port), "%d", (int)request->port);
+        mbedtls_ssl_init(&request->connection->ssl_context);
+        mbedtls_net_init(&request->connection->net_context);
+        snprintf(port, sizeof(port), "%d", (int)request->connection->port);
         // https://gist.github.com/Barakat/675c041fd94435b270a25b5881987a30
-        if ((status = mbedtls_ssl_setup(&request->ssl_context, &ssl_config)) != 0) {
-          mbedtls_snprintf(1, err, sizeof(err), status, "can't set up ssl for %s: %d", request->hostname, status); goto cleanup;
+        if ((status = mbedtls_ssl_setup(&request->connection->ssl_context, &ssl_config)) != 0) {
+          mbedtls_snprintf(1, err, sizeof(err), status, "can't set up ssl for %s: %d", request->connection->hostname, status); goto cleanup;
         }
-        mbedtls_net_set_nonblock(&request->net_context);
-        mbedtls_ssl_set_bio(&request->ssl_context, &request->net_context, mbedtls_net_send, NULL, mbedtls_net_recv_timeout);
-        if ((status = mbedtls_net_connect(&request->net_context, request->hostname, port, MBEDTLS_NET_PROTO_TCP)) != 0) {
-          mbedtls_snprintf(1, err, sizeof(err), status, "can't connect to hostname %s", request->hostname); goto cleanup;
-        } else if ((status = mbedtls_ssl_set_hostname(&request->ssl_context, request->hostname)) != 0) {
-          mbedtls_snprintf(1, err, sizeof(err), status, "can't set hostname %s", request->hostname); goto cleanup;
-        } else if ((status = mbedtls_ssl_handshake(&request->ssl_context)) != 0) {
-          mbedtls_snprintf(1, err, sizeof(err), status, "can't handshake with %s", request->hostname); goto cleanup;
-        } else if (((status = mbedtls_ssl_get_verify_result(&request->ssl_context)) != 0) && !no_verify_ssl) {
-          mbedtls_snprintf(1, err, sizeof(err), status, "can't verify result for %s", request->hostname); goto cleanup;
+        mbedtls_net_set_nonblock(&request->connection->net_context);
+        mbedtls_ssl_set_bio(&request->connection->ssl_context, &request->connection->net_context, mbedtls_net_send, NULL, mbedtls_net_recv_timeout);
+        if ((status = mbedtls_net_connect(&request->connection->net_context, request->connection->hostname, port, MBEDTLS_NET_PROTO_TCP)) != 0) {
+          mbedtls_snprintf(1, err, sizeof(err), status, "can't connect to hostname %s", request->connection->hostname); goto cleanup;
+        } else if ((status = mbedtls_ssl_set_hostname(&request->connection->ssl_context, request->connection->hostname)) != 0) {
+          mbedtls_snprintf(1, err, sizeof(err), status, "can't set hostname %s", request->connection->hostname); goto cleanup;
+        } else if ((status = mbedtls_ssl_handshake(&request->connection->ssl_context)) != 0) {
+          mbedtls_snprintf(1, err, sizeof(err), status, "can't handshake with %s", request->connection->hostname); goto cleanup;
+        } else if (((status = mbedtls_ssl_get_verify_result(&request->connection->ssl_context)) != 0) && !no_verify_ssl) {
+          mbedtls_snprintf(1, err, sizeof(err), status, "can't verify result for %s", request->connection->hostname); goto cleanup;
         }
       } else {
-        struct hostent *host = gethostbyname(request->hostname);
+        struct hostent *host = gethostbyname(request->connection->hostname);
         struct sockaddr_in dest_addr = {0};
         if (!host) {
-          snprintf(err, sizeof(err), "can't resolve hostname %s", request->hostname);
+          snprintf(err, sizeof(err), "can't resolve hostname %s", request->connection->hostname);
           goto cleanup;
         }
         int s = socket(AF_INET, SOCK_STREAM, 0);
@@ -656,18 +712,25 @@ static int check_request(request_t* request) {
           ioctlsocket(s, FIONBIO, &mode);
         #endif
         dest_addr.sin_family = AF_INET;
-        dest_addr.sin_port = htons(request->port);
+        dest_addr.sin_port = htons(request->connection->port);
         dest_addr.sin_addr.s_addr = *(long*)(host->h_addr);
         const char* ip = inet_ntoa(dest_addr.sin_addr);
         if (connect(s, (struct sockaddr *) &dest_addr, sizeof(struct sockaddr)) == -1 ) {
           close(s);
-          snprintf(err, sizeof(err), "can't connect to host %s [%s] on port %d", request->hostname, ip, request->port);
+          snprintf(err, sizeof(err), "can't connect to host %s [%s] on port %d", request->connection->hostname, ip, request->connection->port);
           goto cleanup;
         }
-        request->socket = s;
+        request->connection->socket = s;
       }
+      request->connection->is_open = 1;
       cleanup:
         if (err[0]) {
+          if (request->connection->is_ssl) {
+            mbedtls_ssl_free(&request->connection->ssl_context);
+            mbedtls_net_free(&request->connection->net_context);
+          }
+          request->connection->socket = -1;
+          request->connection->active = NULL;
           request->state = REQUEST_STATE_ERROR;
           strncpy(request->chunk, err, sizeof(request->chunk));
           request->chunk_length = strlen(err);
@@ -680,13 +743,18 @@ static int check_request(request_t* request) {
       if (request->chunk_length > 0) {
         int bytes_written = request_socket_write(request, request->chunk, request->chunk_length);
         if (bytes_written < 0) {
+          // In the case where the connection was simply terminated, head back to top, and try to reopen it.
+          if (request->state == REQUEST_STATE_SEND_HEADERS && errno == ECONNRESET) {
+            close_connection(request->connection);
+            request->state = REQUEST_STATE_INIT_CONNECTION;
+          }
           request->state = REQUEST_STATE_ERROR;
           return 0;
         }
         if (bytes_written == request->chunk_length) {
           if (request->verbose == 2)
             write(fileno(stderr), request->chunk, request->chunk_length);
-          request->last_activity = time(NULL);
+          request->connection->last_activity = time(NULL);
           request->chunk_length = 0;
           if (request->state == REQUEST_STATE_SEND_HEADERS) {
             if (request->body_length != 0)
@@ -697,7 +765,7 @@ static int check_request(request_t* request) {
         } else if (bytes_written > 0) {
           if (request->verbose == 2)
             write(fileno(stderr), request->chunk, request->chunk_length);
-          request->last_activity = time(NULL);
+          request->connection->last_activity = time(NULL);
           memmove(&request->chunk[bytes_written], request->chunk, request->chunk_length - bytes_written);
           request->chunk_length -= bytes_written;
         }
@@ -714,7 +782,7 @@ static int check_request(request_t* request) {
         return 0;
       }
       if (bytes_read > 0) {
-        request->last_activity = time(NULL);
+        request->connection->last_activity = time(NULL);
         request->chunk_length += bytes_read;
         const char* boundary = strstr(request->chunk, "\r\n\r\n");
         if (boundary)
@@ -728,7 +796,7 @@ static int check_request(request_t* request) {
           request->state = REQUEST_STATE_ERROR;
           return 0;
         } else if (bytes_read > 0) {
-          request->last_activity = time(NULL);
+          request->connection->last_activity = time(NULL);
           request->chunk_length += bytes_read;
         }
       }
@@ -737,7 +805,7 @@ static int check_request(request_t* request) {
     case REQUEST_STATE_RECV_COMPLETE: break;
     case REQUEST_STATE_ERROR: break;
   }
-  if (time(NULL) - request->last_activity > request->timeout_length && request->state != REQUEST_STATE_ERROR && request->state != REQUEST_STATE_RECV_COMPLETE) {
+  if (time(NULL) - request->connection->last_activity > request->timeout_length && request->state != REQUEST_STATE_ERROR && request->state != REQUEST_STATE_RECV_COMPLETE) {
     request->state = REQUEST_STATE_ERROR;
     request->chunk_length = snprintf(request->chunk, sizeof(request->chunk), "%s", "request timed out");
   }
@@ -919,10 +987,10 @@ static int f_www_gc(lua_State* L) {
 
 // Core functions, `request` is the primary function, and is stateless (minus the ssl config), and makes raw requests.
 static const luaL_Reg www_api[] = {
-  { "__gc",     f_www_gc      },    // private, reserved cleanup function for the global ssl state and request queue
-  { "request",  f_www_request },    // response = www.request({ url = string, timeout = 5, yield = 0.01, body = string|function(), method = string|"GET", headers = table|{}, response = nil|function(response, chunk)  })
-  { "ssl",      f_www_ssl     },    // www.ssl(type, path|nil, debug_level)
-  { NULL,       NULL          }
+  { "__gc",          f_www_gc            },    // private, reserved cleanup function for the global ssl state and request queue
+  { "request",       f_www_request       },    // response, connection = www.request({ url = string, timeout = 5, yield = 0.01, connection = connection|nil, body = string|function(), method = string|"GET", headers = table|{}, response = nil|function(response, chunk)  })
+  { "ssl",           f_www_ssl           },    // www.ssl(type, path|nil, debug_level)
+  { NULL,            NULL                }
 };
 
 
@@ -955,6 +1023,7 @@ int luaopen_www(lua_State* L) {
       local options = { max_redirects = 10, yield = 0.01, max_timeout = 5, headers = { ['user-agent'] = 'lite-xl-www/' .. www.version } }\n\
       for k,v in pairs(default_options or {}) do options[k] = v end\n\
       return {\n\
+        connections = {},\n\
         encode = function(value) return value end,\n\
         decode = function(value) return value end,\n\
         components = function(url)\n\
@@ -977,7 +1046,9 @@ int luaopen_www(lua_State* L) {
               for k,v in pairs(self.cookies[hostname]) do table.insert(values, k .. '=' .. self.encode(v.value)) end\n\
               if not t.headers['cookie'] then t.headers['cookie'] = table.concat(values, '; ') end\n\
             end\n\
-            res = www.request(t)\n\
+            t.connection = self.connections[hostname]\n\
+            res, connection = www.request(t)\n\
+            self.connections[hostname] = connection\n\
             if res.headers['set-cookie'] then\n\
               for i,v in ipairs(type(res.headers['set-cookie']) == 'table' and res.headers['set-cookie'] or { res.headers['set-cookie'] }) do\n\
                 local _, e, name, value = v:find('^([^=]+)=([^;]+)')\n\

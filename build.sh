@@ -8,7 +8,7 @@
 : ${JOBS=4}
 
 SRCS="src/*.c"
-CFLAGS="$CFLAGS -Ilib/prefix/include -fPIC -Ilib/lite-xl/resources/include"
+CFLAGS="$CFLAGS -Ilib/prefix/include -fPIC -Ilib/lite-xl/resources/include -Wno-unused-result"
 LDFLAGS="$LDFLAGS -lm -Llib/prefix/lib"
 
 [[ $OSTYPE != *'darwin'* ]] && CFLAGS="$CFLAGS -static-libgcc"
