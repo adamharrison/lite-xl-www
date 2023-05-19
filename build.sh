@@ -7,7 +7,7 @@
 : ${BIN=www.so}
 : ${JOBS=4}
 
-SRCS="src/*.c"
+SRCS="www.c"
 CFLAGS="$CFLAGS -Ilib/prefix/include -fPIC -Ilib/lite-xl/resources/include -Wno-unused-result"
 LDFLAGS="$LDFLAGS -lm -Llib/prefix/lib"
 
