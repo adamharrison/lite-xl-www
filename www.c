@@ -157,6 +157,7 @@ typedef struct connection_t {
 
 typedef enum {
   REQUEST_STATE_INIT_CONNECTION,
+  REQUEST_STATE_HANDHSAKE,
   REQUEST_STATE_SEND_HEADERS,
   REQUEST_STATE_SEND_BODY,
   REQUEST_STATE_RECV_HEADERS,
@@ -613,6 +614,7 @@ static int f_www_request(lua_State* L) {
     connection->port = port;
     connection->socket = -1;
     connection->is_ssl = strcmp(protocol, "https") == 0;
+    connection->is_open = 0;
     connection->last_activity = time(NULL);
     connection->active = NULL;
   } else {
@@ -664,9 +666,14 @@ static int request_socket_write(request_t* request, const char* buf, int len) {
 }
 
 static int request_socket_read(request_t* request, char* buf, int len) {
-  return request->connection->is_ssl ? mbedtls_ssl_read(&request->connection->ssl_context, (unsigned char*)buf, len) : read(request->connection->socket, buf, len);
+  if (request->connection->is_ssl) {
+    int recvd = mbedtls_ssl_read(&request->connection->ssl_context, (unsigned char*)buf, len);
+    if (recvd == MBEDTLS_ERR_SSL_WANT_READ || recvd == MBEDTLS_ERR_SSL_WANT_WRITE)
+      return 0;
+    return recvd;
+  } else
+    return read(request->connection->socket, buf, len);
 }
-
 
 static int check_request(request_t* request) {
   switch (request->state) {
@@ -691,16 +698,13 @@ static int check_request(request_t* request) {
         if ((status = mbedtls_ssl_setup(&request->connection->ssl_context, &ssl_config)) != 0) {
           mbedtls_snprintf(1, err, sizeof(err), status, "can't set up ssl for %s: %d", request->connection->hostname, status); goto cleanup;
         }
-        mbedtls_net_set_nonblock(&request->connection->net_context);
-        mbedtls_ssl_set_bio(&request->connection->ssl_context, &request->connection->net_context, mbedtls_net_send, NULL, mbedtls_net_recv_timeout);
+        mbedtls_ssl_set_bio(&request->connection->ssl_context, &request->connection->net_context, mbedtls_net_send, mbedtls_net_recv, NULL);
         if ((status = mbedtls_net_connect(&request->connection->net_context, request->connection->hostname, port, MBEDTLS_NET_PROTO_TCP)) != 0) {
           mbedtls_snprintf(1, err, sizeof(err), status, "can't connect to hostname %s", request->connection->hostname); goto cleanup;
+        } else if ((status = mbedtls_net_set_nonblock(&request->connection->net_context)) != 0) {
+          mbedtls_snprintf(1, err, sizeof(err), status, "can't set up ssl for nonblocking: %d", status); goto cleanup;
         } else if ((status = mbedtls_ssl_set_hostname(&request->connection->ssl_context, request->connection->hostname)) != 0) {
           mbedtls_snprintf(1, err, sizeof(err), status, "can't set hostname %s", request->connection->hostname); goto cleanup;
-        } else if ((status = mbedtls_ssl_handshake(&request->connection->ssl_context)) != 0) {
-          mbedtls_snprintf(1, err, sizeof(err), status, "can't handshake with %s", request->connection->hostname); goto cleanup;
-        } else if (((status = mbedtls_ssl_get_verify_result(&request->connection->ssl_context)) != 0) && !no_verify_ssl) {
-          mbedtls_snprintf(1, err, sizeof(err), status, "can't verify result for %s", request->connection->hostname); goto cleanup;
         }
       } else {
         struct hostent *host = gethostbyname(request->connection->hostname);
@@ -741,8 +745,24 @@ static int check_request(request_t* request) {
           strncpy(request->chunk, err, sizeof(request->chunk));
           request->chunk_length = strlen(err);
         } else {
-          request->state = REQUEST_STATE_SEND_HEADERS;
+          if (request->connection->is_ssl)
+            request->state = REQUEST_STATE_HANDHSAKE;
+          else
+            request->state = REQUEST_STATE_SEND_HEADERS;
         }
+    } break;
+    case REQUEST_STATE_HANDHSAKE: {
+      char err[MAX_ERROR_SIZE] = {0};
+      int status = mbedtls_ssl_handshake(&request->connection->ssl_context);
+      if (status == MBEDTLS_ERR_SSL_WANT_READ || status == MBEDTLS_ERR_SSL_WANT_WRITE)
+        break;
+      if (status != 0) {
+        mbedtls_snprintf(1, err, sizeof(err), status, "can't handshake with %s", request->connection->hostname); goto cleanup;
+      } else if (((status = mbedtls_ssl_get_verify_result(&request->connection->ssl_context)) != 0) && !no_verify_ssl) {
+        mbedtls_snprintf(1, err, sizeof(err), status, "can't verify result for %s", request->connection->hostname); goto cleanup;
+      }
+      request->connection->last_activity = time(NULL);
+      request->state = REQUEST_STATE_SEND_HEADERS;
     } break;
     case REQUEST_STATE_SEND_HEADERS:
     case REQUEST_STATE_SEND_BODY:
@@ -753,8 +773,10 @@ static int check_request(request_t* request) {
           if (request->state == REQUEST_STATE_SEND_HEADERS && errno == ECONNRESET) {
             close_connection(request->connection);
             request->state = REQUEST_STATE_INIT_CONNECTION;
+          } else {
+            request->state = REQUEST_STATE_ERROR;
+            request->chunk_length = mbedtls_snprintf(request->connection->is_ssl, request->chunk, sizeof(request->chunk), bytes_written, "%s", "error sending headers or body");
           }
-          request->state = REQUEST_STATE_ERROR;
           return 0;
         }
         if (bytes_written == request->chunk_length) {
@@ -785,9 +807,12 @@ static int check_request(request_t* request) {
       int bytes_read = request_socket_read(request, &request->chunk[request->chunk_length], sizeof(request->chunk) - request->chunk_length);
       if (bytes_read < 0) {
         request->state = REQUEST_STATE_ERROR;
+        request->chunk_length = mbedtls_snprintf(request->connection->is_ssl, request->chunk, sizeof(request->chunk), bytes_read, "%s", "error receiving headers");
         return 0;
       }
       if (bytes_read > 0) {
+        if (request->verbose == 2)
+          write(fileno(stderr), request->chunk, request->chunk_length);
         request->connection->last_activity = time(NULL);
         request->chunk_length += bytes_read;
         const char* boundary = strstr(request->chunk, "\r\n\r\n");
@@ -800,8 +825,11 @@ static int check_request(request_t* request) {
         int bytes_read = request_socket_read(request, &request->chunk[request->chunk_length], sizeof(request->chunk) - request->chunk_length);
         if (bytes_read < 0) {
           request->state = REQUEST_STATE_ERROR;
+          request->chunk_length = mbedtls_snprintf(request->connection->is_ssl, request->chunk, sizeof(request->chunk), bytes_read, "%s", "error receiving body");
           return 0;
         } else if (bytes_read > 0) {
+          if (request->verbose == 2)
+            write(fileno(stderr), request->chunk, request->chunk_length);
           request->connection->last_activity = time(NULL);
           request->chunk_length += bytes_read;
         }

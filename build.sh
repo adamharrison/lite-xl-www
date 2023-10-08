@@ -16,8 +16,11 @@ LDFLAGS="$LDFLAGS -lm -Llib/prefix/lib"
 [[ "$@" == "clean" ]] && rm -rf lib/zlib/build lib/mbedtls-2.27.0/build lib/prefix *.so && exit 0
 $CMAKE --version >/dev/null 2>/dev/null || { echo "Please ensure that you have cmake installed." && exit -1; }
 
+CMAKE_BUILD_TYPE=Release
+[[ "$@" == *'-g'* ]] && CMAKE_BUILD_TYPE=Debug
+
 # Build supporting libraries, libz, libmbedtls, libmbedcrypto, libgit2
-CMAKE_DEFAULT_FLAGS=" $CMAKE_DEFAULT_FLAGS -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=`pwd`/lib/prefix -DCMAKE_INSTALL_PREFIX=`pwd`/lib/prefix -DBUILD_SHARED_LIBS=OFF"
+CMAKE_DEFAULT_FLAGS=" $CMAKE_DEFAULT_FLAGS -DCMAKE_BUILD_TYPE=$CMAKE_BUILD_TYPE -DCMAKE_PREFIX_PATH=`pwd`/lib/prefix -DCMAKE_INSTALL_PREFIX=`pwd`/lib/prefix -DBUILD_SHARED_LIBS=OFF"
 mkdir -p lib/prefix/include lib/prefix/lib
 if [[ "$@" != *"-lz"* ]]; then
   [ ! -e "lib/zlib" ] && echo "Make sure you've cloned submodules. (git submodule update --init --depth=1)" && exit -1

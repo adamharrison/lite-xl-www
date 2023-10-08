@@ -7,26 +7,32 @@
     "files": [{
         "url": "https://github.com/adamharrison/lite-xl-www/releases/download/latest/www.x86-linux.so",
         "arch": "x86-linux",
+        "path": "init.x86-linux.so",
         "checksum": "SKIP"
     }, {
         "url": "https://github.com/adamharrison/lite-xl-www/releases/download/latest/www.x86_64-linux.so",
         "arch": "x86_64-linux",
+        "path": "init.x86_64-linux.so",
         "checksum": "SKIP"
     } , {
         "url": "https://github.com/adamharrison/lite-xl-www/releases/download/latest/www.x86-windows.dll",
         "arch": "x86-windows",
+        "path": "init.x86-windows.dll",
         "checksum": "SKIP"
     }, {
         "url": "https://github.com/adamharrison/lite-xl-www/releases/download/latest/www.x86_64-windows.dll",
         "arch": "x86_64-windows",
+        "path": "init.x86_64-windows.dll",
         "checksum": "SKIP"
     }, {
         "url": "https://github.com/adamharrison/lite-xl-www/releases/download/latest/www.x86_64-darwin.dll",
         "arch": "x86_64-darwin",
+        "path": "init.x86_64-darwin.so",
         "checksum": "SKIP"
     }, {
         "url": "https://github.com/adamharrison/lite-xl-www/releases/download/latest/www.aarch64-darwin.dll",
         "arch": "aarch64-darwin",
+        "path": "init.aarch64-darwin.so",
         "checksum": "SKIP"
     }]
   }]
