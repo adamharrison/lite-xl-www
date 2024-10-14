@@ -2,7 +2,7 @@
   "addons": [{
     "id": "www",
     "type": "library",
-    "version": "0.1",
+    "version": "0.3",
     "description": "A simple library that provides a web client to fetch, and submit data via HTTP requests.",
     "files": [{
         "url": "https://github.com/adamharrison/lite-xl-www/releases/download/latest/www.x86-linux.so",
